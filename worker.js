@@ -1,944 +1,2175 @@
-/**
- * 核心配置变量 (需要在 Cloudflare 后台配置):
- * AZURE_TENANT_ID: 租户 ID
- * AZURE_CLIENT_ID: 客户端 ID
- * AZURE_CLIENT_SECRET: 客户端密钥
- * CF_TURNSTILE_SECRET: Turnstile Secret Key
- * TURNSTILE_SITE_KEY: Turnstile Site Key
- * DEFAULT_DOMAIN: 你的邮箱后缀 (不带@)
- * SKU_MAP: JSON字符串，映射前台名称到SKU ID。例: {"E5开发版":"你的SKU_ID_1", "A1教育版":"你的SKU_ID_2"}
- * ADMIN_TOKEN: 管理员访问密码
- * HIDDEN_USER: (可选) 隐藏的特权账户完整邮箱
- * ENABLE_DEBUG: (可选) 设置为 'true' 开启调试日志
- */
-
-const debugLog = (env, ...args) => {
-    if (env.ENABLE_DEBUG === 'true') console.log('[DEBUG]', ...args);
+const KV = {
+  CONFIG: 'config',
+  INSTALL_LOCK: 'install_lock',
+  SESS_PREFIX: 'sess:',
+  INVITES: 'invites', // JSON array
+  COMPAT_CARDS: 'cards', // backward compatibility
 };
 
-// --- 辅助函数：密码强度校验 (四选三) ---
-function checkPasswordComplexity(pwd) {
-    if (!pwd || pwd.length < 8) return false;
-    let score = 0;
-    if (/[a-z]/.test(pwd)) score++; // 小写
-    if (/[A-Z]/.test(pwd)) score++; // 大写
-    if (/\d/.test(pwd)) score++;    // 数字
-    if (/[^a-zA-Z0-9]/.test(pwd)) score++; // 符号
-    return score >= 3;
+const DEFAULT_CONFIG = {
+  adminPath: '/admin',
+  adminUsername: 'admin',
+  adminPasswordHash: '',
+  turnstile: { siteKey: '', secretKey: '' },
+  globals: [], // [{id,label,tenantId,clientId,clientSecret,defaultDomain,skuMap (object)}]
+  // 额外保护账户：仅按用户名（@ 前缀 / local-part）匹配。
+  // - 用途：1) 禁止前台注册这些敏感用户名；2) 若这些账号已存在，禁止通过面板/API 删除。
+  // - 默认内置常见高危用户名，避免首次部署未设置防护导致全局被盗。
+  // 兼容字段 protectedUsers（旧版按完整邮箱保护）仍保留读取，但不再在 UI 中展示/保存。
+  protectedUsers: [], // legacy: full UPN list (deprecated)
+  protectedPrefixes: ['admin', 'superadmin', 'root', 'administrator', 'sysadmin', 'owner', 'support', 'helpdesk'],
+  invite: { enabled: false },
+};
+
+const GITHUB_LINK = 'https://github.com/zixiwangluo/CF-M365-Admin';
+
+/* -------------------- Utility -------------------- */
+const enc = new TextEncoder();
+
+async function sha256(txt) {
+  const buf = await crypto.subtle.digest('SHA-256', enc.encode(txt));
+  return Array.from(new Uint8Array(buf))
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('');
 }
 
-// --- GitHub 图标 SVG (硬编码复用) ---
-const GITHUB_ICON = `<svg viewBox="0 0 16 16" version="1.1" width="20" height="20" aria-hidden="true" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"></path></svg>`;
-
-// --- 1. 前台注册页面 HTML (大幅美化版) ---
-const HTML_REGISTER_PAGE = (siteKey, skuOptions) => `
-<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Office 365 自助开通</title>
-    <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
-    <style>
-        :root {
-            --primary: #4f46e5;
-            --primary-hover: #4338ca;
-            --bg-gradient: linear-gradient(-45deg, #ee7752, #e73c7e, #23a6d5, #23d5ab);
-            --glass-bg: rgba(255, 255, 255, 0.85);
-            --glass-border: rgba(255, 255, 255, 0.4);
-            --text-main: #1f2937;
-            --text-sub: #6b7280;
-        }
-        @keyframes gradient {
-            0% { background-position: 0% 50%; }
-            50% { background-position: 100% 50%; }
-            100% { background-position: 0% 50%; }
-        }
-        @keyframes fadeInUp {
-            from { opacity: 0; transform: translateY(20px); }
-            to { opacity: 1; transform: translateY(0); }
-        }
-        body {
-            font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-            background: var(--bg-gradient);
-            background-size: 400% 400%;
-            animation: gradient 15s ease infinite;
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            min-height: 100vh;
-            margin: 0;
-            color: var(--text-main);
-        }
-        .card {
-            background: var(--glass-bg);
-            backdrop-filter: blur(12px);
-            -webkit-backdrop-filter: blur(12px);
-            padding: 40px;
-            border-radius: 20px;
-            box-shadow: 0 15px 35px rgba(0,0,0,0.1), 0 5px 15px rgba(0,0,0,0.05);
-            width: 100%;
-            max-width: 420px;
-            border: 1px solid var(--glass-border);
-            animation: fadeInUp 0.8s cubic-bezier(0.2, 0.8, 0.2, 1);
-            position: relative;
-            overflow: hidden;
-            box-sizing: border-box;
-            margin: 20px;
-        }
-        .header-row {
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            gap: 12px;
-            margin-bottom: 30px;
-        }
-        h2 { margin: 0; font-weight: 700; color: #111827; letter-spacing: -0.5px; }
-        .github-link {
-            color: var(--text-main);
-            transition: transform 0.3s ease, color 0.3s ease;
-            display: flex;
-            align-items: center;
-        }
-        .github-link:hover { transform: scale(1.1) rotate(5deg); color: var(--primary); }
-
-        /* 自定义 Input 样式 */
-        .input-group { margin-bottom: 20px; text-align: left; position: relative; }
-        .label { font-size: 13px; font-weight: 600; color: var(--text-sub); margin-bottom: 8px; display: block; }
-        input {
-            width: 100%;
-            padding: 14px 16px;
-            border: 2px solid #e5e7eb;
-            border-radius: 12px;
-            box-sizing: border-box;
-            font-size: 15px;
-            transition: all 0.3s ease;
-            background: rgba(255,255,255,0.6);
-        }
-        input:focus {
-            border-color: var(--primary);
-            box-shadow: 0 0 0 4px rgba(79, 70, 229, 0.1);
-            outline: none;
-            background: white;
-        }
-
-        /* 自定义 Select 样式 */
-        .custom-select {
-            position: relative;
-            cursor: pointer;
-            user-select: none;
-        }
-        .select-trigger {
-            background: rgba(255,255,255,0.6);
-            border: 2px solid #e5e7eb;
-            border-radius: 12px;
-            padding: 14px 16px;
-            font-size: 15px;
-            color: var(--text-main);
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            transition: all 0.3s;
-        }
-        .select-trigger:hover { border-color: #d1d5db; }
-        .select-trigger.active { border-color: var(--primary); background: white; }
-        .select-arrow { transition: transform 0.3s; width: 10px; height: 10px; border-right: 2px solid #6b7280; border-bottom: 2px solid #6b7280; transform: rotate(45deg) translateY(-2px); }
-        .select-trigger.active .select-arrow { transform: rotate(225deg) translateY(-2px); }
-        
-        .options-container {
-            position: absolute;
-            top: 110%;
-            left: 0;
-            right: 0;
-            background: white;
-            border-radius: 12px;
-            box-shadow: 0 10px 25px rgba(0,0,0,0.1);
-            opacity: 0;
-            visibility: hidden;
-            transform: translateY(-10px);
-            transition: all 0.3s cubic-bezier(0.2, 0.8, 0.2, 1);
-            z-index: 100;
-            overflow: hidden;
-            border: 1px solid #f3f4f6;
-        }
-        .options-container.open { opacity: 1; visibility: visible; transform: translateY(0); }
-        .option {
-            padding: 12px 16px;
-            transition: background 0.2s;
-            font-size: 14px;
-        }
-        .option:hover { background: #f3f4f6; color: var(--primary); }
-        .option.selected { background: #e0e7ff; color: var(--primary); font-weight: 600; }
-
-        /* 按钮与消息 */
-        button {
-            width: 100%;
-            padding: 14px;
-            background-color: var(--primary);
-            color: white;
-            border: none;
-            border-radius: 12px;
-            font-size: 16px;
-            font-weight: 600;
-            cursor: pointer;
-            transition: all 0.3s ease;
-            margin-top: 10px;
-            box-shadow: 0 4px 6px rgba(79, 70, 229, 0.2);
-        }
-        button:hover { background-color: var(--primary-hover); transform: translateY(-2px); box-shadow: 0 6px 12px rgba(79, 70, 229, 0.3); }
-        button:active { transform: translateY(0); }
-        button:disabled { background-color: #9ca3af; cursor: not-allowed; transform: none; box-shadow: none; }
-        
-        .message { margin-top: 20px; font-size: 14px; padding: 12px; border-radius: 8px; display: none; line-height: 1.5; text-align: left; animation: fadeInUp 0.3s; }
-        .error { background-color: #fee2e2; color: #991b1b; border: 1px solid #fecaca; }
-        .success { background-color: #dcfce7; color: #166534; border: 1px solid #bbf7d0; }
-
-        .cf-turnstile { display: flex; justify-content: center; margin: 20px 0; }
-        
-        .footer {
-            margin-top: 30px;
-            padding-top: 20px;
-            border-top: 1px solid #e5e7eb;
-            font-size: 12px;
-            color: var(--text-sub);
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            gap: 5px;
-        }
-        .footer a { color: var(--text-sub); text-decoration: none; display: flex; align-items: center; gap: 6px; transition: color 0.2s; }
-        .footer a:hover { color: var(--primary); }
-    </style>
-</head>
-<body>
-    <div class="card">
-        <div class="header-row">
-            <h2>Office 365 自助开通</h2>
-            <a href="https://github.com/zixiwangluo/CF-M365-Admin" target="_blank" class="github-link" title="View Source on GitHub">
-                ${GITHUB_ICON}
-            </a>
-        </div>
-        
-        <form id="regForm">
-            <!-- 隐藏的真实 Input，用于存储选择的值 -->
-            <input type="hidden" id="skuName" name="skuName" value="">
-            
-            <div class="input-group">
-                <span class="label">选择订阅类型</span>
-                <div class="custom-select">
-                    <div class="select-trigger" id="selectTrigger">
-                        <span>请选择...</span>
-                        <div class="select-arrow"></div>
-                    </div>
-                    <div class="options-container" id="optionsContainer">
-                        ${skuOptions.map((opt, index) => `<div class="option" data-value="${opt}">${opt}</div>`).join('')}
-                    </div>
-                </div>
-            </div>
-
-            <div class="input-group">
-                <span class="label">用户名 (仅字母和数字)</span>
-                <input type="text" id="username" placeholder="例如: admin" required pattern="[a-zA-Z0-9]+">
-            </div>
-            
-            <div class="input-group">
-                <span class="label">密码 (8位+, 含大/小写/数字/符号 3种)</span>
-                <input type="password" id="password" placeholder="设置您的强密码" required>
-            </div>
-            
-            <div class="cf-turnstile" data-sitekey="${siteKey}"></div>
-            
-            <button type="submit" id="btn">立即创建账号</button>
-        </form>
-        
-        <div id="msg" class="message"></div>
-        
-        <div class="footer">
-            <div>Powered By CloudFlare Workers</div>
-            <a href="https://github.com/zixiwangluo/CF-M365-Admin" target="_blank">
-                ${GITHUB_ICON}
-                <span>CF-M365-Admin</span>
-            </a>
-        </div>
-    </div>
-
-    <script>
-        // --- 自定义下拉框逻辑 ---
-        const trigger = document.getElementById('selectTrigger');
-        const container = document.getElementById('optionsContainer');
-        const options = document.querySelectorAll('.option');
-        const hiddenInput = document.getElementById('skuName');
-        const triggerText = trigger.querySelector('span');
-
-        // 默认选择第一项
-        if (options.length > 0) {
-            selectOption(options[0]);
-        }
-
-        function toggleSelect(e) {
-            e.stopPropagation();
-            trigger.classList.toggle('active');
-            container.classList.toggle('open');
-        }
-
-        function closeSelect() {
-            trigger.classList.remove('active');
-            container.classList.remove('open');
-        }
-
-        function selectOption(option) {
-            const val = option.getAttribute('data-value');
-            hiddenInput.value = val;
-            triggerText.innerText = val;
-            options.forEach(o => o.classList.remove('selected'));
-            option.classList.add('selected');
-            closeSelect();
-        }
-
-        trigger.addEventListener('click', toggleSelect);
-        
-        options.forEach(opt => {
-            opt.addEventListener('click', (e) => {
-                e.stopPropagation();
-                selectOption(opt);
-            });
-        });
-
-        document.addEventListener('click', closeSelect);
-
-        // --- 密码与表单逻辑 ---
-        function checkComplexity(pwd) {
-            let score = 0;
-            if (/[a-z]/.test(pwd)) score++;
-            if (/[A-Z]/.test(pwd)) score++;
-            if (/\\d/.test(pwd)) score++;
-            if (/[^a-zA-Z0-9]/.test(pwd)) score++;
-            return score >= 3;
-        }
-
-        document.getElementById('regForm').addEventListener('submit', async (e) => {
-            e.preventDefault();
-            const btn = document.getElementById('btn');
-            const msg = document.getElementById('msg');
-            const username = document.getElementById('username').value;
-            const password = document.getElementById('password').value;
-            const skuVal = hiddenInput.value;
-
-            if (!skuVal) {
-                msg.style.display = 'block'; msg.className = 'message error';
-                msg.innerText = '⚠️ 请先选择订阅类型';
-                return;
-            }
-
-            if (password.toLowerCase().includes(username.toLowerCase())) {
-                msg.style.display = 'block'; msg.className = 'message error';
-                msg.innerText = '❌ 安全警告：密码不能包含用户名，请重设';
-                return;
-            }
-
-            if (password.length < 8 || !checkComplexity(password)) {
-                msg.style.display = 'block'; msg.className = 'message error';
-                msg.innerText = '❌ 密码太简单：需8位以上，且包含大写、小写、数字、符号中的至少3种';
-                return;
-            }
-
-            btn.disabled = true; btn.innerHTML = '<span style="display:inline-block;animation:spin 1s linear infinite">↻</span> 正在部署资源...';
-            msg.style.display = 'none';
-
-            const formData = new FormData();
-            formData.append('skuName', skuVal);
-            formData.append('username', username);
-            formData.append('password', password);
-            formData.append('cf-turnstile-response', document.querySelector('[name="cf-turnstile-response"]').value);
-            
-            try {
-                const res = await fetch('/', { method: 'POST', body: formData });
-                const data = await res.json();
-                msg.style.display = 'block';
-                if (data.success) {
-                    msg.className = 'message success';
-                    msg.innerHTML = '🎉 <b>开通成功！</b><br>账号: ' + data.email + '<br>密码: (您刚才设置的)<br><a href="https://portal.office.com" target="_blank" style="color:#15803d;font-weight:bold;margin-top:5px;display:inline-block">👉 前往 Office.com 登录</a>';
-                    document.getElementById('regForm').reset();
-                    // 重置下拉框到默认
-                    if (options.length > 0) selectOption(options[0]);
-                    if(typeof turnstile !== 'undefined') turnstile.reset();
-                } else {
-                    msg.className = 'message error';
-                    msg.innerText = '❌ ' + data.message;
-                    if(typeof turnstile !== 'undefined') turnstile.reset();
-                }
-            } catch (err) {
-                msg.style.display = 'block'; msg.className = 'message error';
-                msg.innerText = '网络连接似乎断了，请稍后重试';
-            } finally {
-                btn.disabled = false; btn.innerText = '立即创建账号';
-            }
-        });
-        
-        // 添加简单的旋转动画样式
-        const styleSheet = document.createElement("style");
-        styleSheet.innerText = "@keyframes spin { 100% { transform: rotate(360deg); } }";
-        document.head.appendChild(styleSheet);
-    </script>
-</body>
-</html>
-`;
-
-// --- 2. 后台管理页面 HTML (美化版) ---
-const HTML_ADMIN_PAGE = (skuMapJson) => `
-<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Office 365 用户管理控制台</title>
-    <style>
-        :root { --admin-primary: #0078d4; --admin-bg: #f3f2f1; }
-        body { font-family: "Segoe UI", -apple-system, sans-serif; padding: 0; margin: 0; background: var(--admin-bg); color: #201f1e; }
-        .nav { background: white; padding: 15px 30px; box-shadow: 0 1px 4px rgba(0,0,0,0.1); display: flex; justify-content: space-between; align-items: center;}
-        .nav h1 { margin: 0; font-size: 20px; font-weight: 600; display: flex; align-items: center; gap: 10px; }
-        .container { max-width: 1400px; margin: 30px auto; padding: 0 20px; }
-        
-        .card { background: white; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); padding: 25px; margin-bottom: 20px; animation: fadeIn 0.5s; }
-        @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
-
-        .toolbar { display: flex; gap: 12px; margin-bottom: 20px; flex-wrap: wrap; }
-        button { padding: 10px 20px; border: none; border-radius: 6px; cursor: pointer; font-weight: 600; font-size: 14px; transition: all 0.2s; display: flex; align-items: center; gap: 6px;}
-        button:hover { opacity: 0.9; transform: translateY(-1px); }
-        button:active { transform: translateY(0); }
-        
-        .btn-refresh { background: white; color: var(--admin-primary); border: 1px solid var(--admin-primary); }
-        .btn-refresh:hover { background: #f0f8ff; }
-        .btn-del { background: #d13438; color: white; box-shadow: 0 2px 5px rgba(209, 52, 56, 0.3); }
-        .btn-pwd { background: #ffaa44; color: white; box-shadow: 0 2px 5px rgba(255, 170, 68, 0.3); }
-        .btn-lic { background: #107c10; color: white; box-shadow: 0 2px 5px rgba(16, 124, 16, 0.3); }
-
-        table { width: 100%; border-collapse: separate; border-spacing: 0; margin-top: 10px; font-size: 14px; }
-        th { background: #f8f9fa; padding: 15px; text-align: left; border-bottom: 2px solid #eee; color: #605e5c; font-weight: 600; cursor: pointer; user-select: none; }
-        td { padding: 15px; border-bottom: 1px solid #f3f2f1; vertical-align: middle; transition: background 0.2s; }
-        tr:hover td { background: #faf9f8; }
-        tr:last-child td { border-bottom: none; }
-        
-        .tag { padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: 500; display:inline-block; margin:2px;}
-        .tag-blue { background: #e0efff; color: #005a9e; }
-        
-        .modal { display: none; position: fixed; top:0; left:0; width:100%; height:100%; background: rgba(0,0,0,0.4); backdrop-filter: blur(4px); justify-content: center; align-items: center; z-index: 1000; animation: fadeIn 0.2s;}
-        .modal-content { background: white; padding: 30px; border-radius: 12px; width: 600px; max-width: 90%; max-height: 85vh; overflow-y: auto; box-shadow: 0 10px 30px rgba(0,0,0,0.2); transform: scale(0.95); animation: popIn 0.3s forwards;}
-        @keyframes popIn { to { transform: scale(1); } }
-        
-        .close { float: right; cursor: pointer; font-size: 24px; color: #605e5c; transition: color 0.2s; }
-        .close:hover { color: #000; }
-        
-        .loading { text-align: center; padding: 40px; color: #605e5c; }
-        input[type="checkbox"] { width: 18px; height: 18px; cursor: pointer; }
-        
-        /* 许可证条 */
-        .progress-bar { background: #edebe9; border-radius: 4px; height: 10px; width: 120px; display: inline-block; overflow: hidden; vertical-align: middle; margin-left: 10px;}
-        .progress-fill { height: 100%; background: var(--admin-primary); transition: width 0.5s ease; }
-
-        .footer { text-align: center; padding: 20px; color: #888; font-size: 12px; display: flex; justify-content: center; align-items: center; gap: 8px;}
-        .footer a { color: #888; text-decoration: none; display: flex; align-items: center; gap: 5px; }
-        .footer a:hover { color: var(--admin-primary); }
-    </style>
-</head>
-<body>
-    <div class="nav">
-        <h1><span>⚡</span> Office 365 Admin</h1>
-        <div style="font-size:12px; color:#666;">安全模式: Enabled</div>
-    </div>
-    
-    <div class="container">
-        <div class="card">
-            <div class="toolbar">
-                <button class="btn-refresh" onclick="loadUsers()">🔄 刷新列表</button>
-                <button class="btn-lic" onclick="openLicModal()">📊 查看订阅余量</button> 
-                <button class="btn-pwd" onclick="openPwdModal()">🔑 重置密码</button>
-                <button class="btn-del" onclick="bulkDelete()">🗑️ 批量删除</button>
-            </div>
-            <div id="status" style="margin-bottom:10px; height:20px; color:#107c10; font-weight:600;"></div>
-            
-            <div style="overflow-x: auto;">
-                <table id="mainTable">
-                    <thead>
-                        <tr>
-                            <th width="40"><input type="checkbox" id="selectAll" onclick="toggleAll(this)"></th>
-                            <th onclick="sortTable('displayName')">用户名 <span id="sort-displayName"></span></th>
-                            <th onclick="sortTable('userPrincipalName')">账号(邮箱) <span id="sort-userPrincipalName"></span></th>
-                            <th>当前订阅</th>
-                            <th onclick="sortTable('createdDateTime')">创建时间 <span id="sort-createdDateTime"></span></th>
-                            <th>UUID</th>
-                        </tr>
-                    </thead>
-                    <tbody id="userTableBody"></tbody>
-                </table>
-            </div>
-            <div class="loading" id="loading">正在从 Microsoft Graph 加载数据...</div>
-        </div>
-        
-        <div class="footer">
-             Powered by CloudFlare Workers
-             <span>|</span>
-             <a href="https://github.com/zixiwangluo/CF-M365-Admin" target="_blank">
-                ${GITHUB_ICON} CF-M365-Admin
-             </a>
-        </div>
-    </div>
-
-    <!-- 密码模态框 -->
-    <div id="pwdModal" class="modal">
-        <div class="modal-content" style="width: 400px;">
-            <span class="close" onclick="closeModal('pwdModal')">&times;</span>
-            <h3 style="margin-top:0">重置密码</h3>
-            <div style="margin: 20px 0;">
-                <label style="display:block; margin-bottom:10px; cursor:pointer;">
-                    <input type="radio" name="pwdType" value="auto" checked onclick="togglePwdInput(false)"> 
-                    🎲 自动生成高强度密码
-                </label>
-                <label style="display:block; margin-bottom:10px; cursor:pointer;">
-                    <input type="radio" name="pwdType" value="custom" onclick="togglePwdInput(true)"> 
-                    ✏️ 自定义密码
-                </label>
-            </div>
-            <input type="text" id="customPwd" placeholder="输入新密码" style="width:100%; padding:10px; border:1px solid #ccc; border-radius:4px; display:none; box-sizing:border-box;">
-            <div style="margin-top:25px; text-align:right;">
-                <button class="btn-pwd" onclick="submitPwdReset()" style="width:100%; justify-content:center;">确认重置</button>
-            </div>
-            <div id="pwdResult" style="margin-top:15px; font-size:13px; color:#005a9e; word-break:break-all; background:#f0f8ff; padding:10px; border-radius:4px; display:none;"></div>
-        </div>
-    </div>
-
-    <!-- 许可证模态框 -->
-    <div id="licModal" class="modal">
-        <div class="modal-content">
-            <span class="close" onclick="closeModal('licModal')">&times;</span>
-            <h3 style="margin-top:0">全局订阅使用情况</h3>
-            <div id="licLoading" style="display:none; text-align:center; padding:20px;">正在查询...</div>
-            <table id="licTable">
-                <thead>
-                    <tr>
-                        <th>订阅名称 / SKU ID</th>
-                        <th>总量</th>
-                        <th>已分配</th>
-                        <th>剩余可用</th>
-                    </tr>
-                </thead>
-                <tbody id="licBody"></tbody>
-            </table>
-        </div>
-    </div>
-
-    <script>
-        const RAW_MAP = ${skuMapJson || '{}'};
-        const ID_TO_NAME = {};
-        for(let key in RAW_MAP) ID_TO_NAME[RAW_MAP[key]] = key;
-
-        let allUsers = [];
-        const API_BASE = '/admin/api';
-
-        // --- 用户列表逻辑 ---
-        async function loadUsers() {
-            document.getElementById('loading').style.display = 'block';
-            document.getElementById('userTableBody').innerHTML = '';
-            resetSortIcons();
-            try {
-                const res = await fetch(API_BASE + '/users?token=' + getToken());
-                const data = await res.json();
-                if (!res.ok || data.error) throw new Error(data.error ? data.error.message : 'API Error');
-                if (!Array.isArray(data.value)) throw new Error('API 响应格式错误');
-                allUsers = data.value;
-                renderTable(allUsers);
-            } catch (e) { alert('加载失败: ' + e.message); } 
-            finally { document.getElementById('loading').style.display = 'none'; }
-        }
-
-        function renderTable(users) {
-            const tbody = document.getElementById('userTableBody');
-            if(users.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="6" style="text-align:center; padding:20px;">暂无用户</td></tr>';
-                return;
-            }
-            tbody.innerHTML = users.map(u => {
-                let licenses = '<span style="color:#999">无订阅</span>';
-                if (u.assignedLicenses && u.assignedLicenses.length > 0) {
-                    licenses = u.assignedLicenses.map(l => {
-                        const name = ID_TO_NAME[l.skuId] || l.skuId;
-                        return \`<span class="tag tag-blue">\${name}</span>\`;
-                    }).join('');
-                }
-                return \`
-                <tr>
-                    <td><input type="checkbox" class="u-check" value="\${u.id}" data-name="\${u.userPrincipalName}"></td>
-                    <td><strong>\${u.displayName}</strong></td>
-                    <td>\${u.userPrincipalName}</td>
-                    <td>\${licenses}</td>
-                    <td>\${new Date(u.createdDateTime).toLocaleString()}</td>
-                    <td style="font-size:11px; color:#aaa; font-family:monospace;">\${u.id}</td>
-                </tr>\`;
-            }).join('');
-        }
-
-        let sortConfig = { key: null, dir: 1 };
-        function sortTable(key) {
-            if (sortConfig.key === key) sortConfig.dir *= -1;
-            else sortConfig = { key: key, dir: 1 };
-
-            resetSortIcons();
-            document.getElementById('sort-' + key).innerText = sortConfig.dir === 1 ? '↓' : '↑';
-
-            allUsers.sort((a, b) => {
-                let valA = a[key] || '';
-                let valB = b[key] || '';
-                if (typeof valA === 'string') return sortConfig.dir * valA.localeCompare(valB, 'zh-CN'); 
-                return valA > valB ? sortConfig.dir : -sortConfig.dir;
-            });
-            renderTable(allUsers);
-        }
-
-        function resetSortIcons() {
-            ['displayName', 'userPrincipalName', 'createdDateTime'].forEach(k => {
-                const el = document.getElementById('sort-' + k);
-                if(el) el.innerText = ''; 
-            });
-        }
-
-        function getToken() { return new URLSearchParams(window.location.search).get('token') || prompt('请输入管理员 Token:'); }
-        function toggleAll(source) { document.querySelectorAll('.u-check').forEach(c => c.checked = source.checked); }
-        function getSelected() { return Array.from(document.querySelectorAll('.u-check:checked')).map(c => ({id: c.value, name: c.getAttribute('data-name')})); }
-
-        async function bulkDelete() {
-            const selected = getSelected();
-            if (selected.length === 0) return alert('请先选择用户');
-            if (!confirm(\`⚠️ 高危操作确认\n\n确定要永久删除选中的 \${selected.length} 个用户吗？\n此操作不可恢复！\`)) return;
-            
-            const statusDiv = document.getElementById('status');
-            statusDiv.innerText = '正在执行批量删除...';
-            
-            for (const u of selected) {
-                try {
-                    const res = await fetch(API_BASE + '/users/' + u.id + '?token=' + getToken(), { method: 'DELETE' });
-                    if(res.status === 403) console.error(u.name + ' 删除失败: 受保护的账户');
-                } catch(e) {}
-            }
-            statusDiv.innerText = '✅ 删除操作完成';
-            setTimeout(() => statusDiv.innerText = '', 3000);
-            loadUsers();
-        }
-
-        // --- 模态框通用逻辑 ---
-        function closeModal(id) { document.getElementById(id).style.display = 'none'; }
-        
-        // --- 密码相关 ---
-        function openPwdModal() { 
-            if (getSelected().length === 0) return alert('请先选择用户'); 
-            document.getElementById('pwdModal').style.display = 'flex'; 
-            document.getElementById('pwdResult').style.display = 'none';
-            document.getElementById('pwdResult').innerText = ''; 
-        }
-        function togglePwdInput(show) { document.getElementById('customPwd').style.display = show ? 'block' : 'none'; }
-        
-        function generatePass() {
-            const chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*";
-            let pass = ""; 
-            for (let i = 0; i < 12; i++) pass += chars.charAt(Math.floor(Math.random() * chars.length));
-            return pass + "Aa1!"; 
-        }
-
-        async function submitPwdReset() {
-            const selected = getSelected();
-            const type = document.querySelector('input[name="pwdType"]:checked').value;
-            let password = (type === 'custom') ? document.getElementById('customPwd').value : '';
-            if (type === 'custom' && !password) return alert('请输入密码');
-            
-            const resultDiv = document.getElementById('pwdResult');
-            resultDiv.style.display = 'block';
-            resultDiv.innerText = '正在请求 Graph API...';
-            
-            let successList = [];
-            for (const u of selected) {
-                const finalPwd = (type === 'auto') ? generatePass() : password;
-                try {
-                    await fetch(API_BASE + '/users/' + u.id + '/password?token=' + getToken(), {
-                        method: 'PATCH',
-                        headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({ password: finalPwd })
-                    });
-                    successList.push(\`\${u.name} -> \${finalPwd}\`);
-                } catch(e) {}
-            }
-            resultDiv.innerHTML = '<b>✅ 操作完成，请复制保存:</b><br><br>' + successList.join('<br>');
-        }
-
-        // --- 许可证查询相关 ---
-        async function openLicModal() {
-            document.getElementById('licModal').style.display = 'flex';
-            document.getElementById('licBody').innerHTML = '';
-            document.getElementById('licLoading').style.display = 'block';
-
-            try {
-                const res = await fetch(API_BASE + '/licenses?token=' + getToken());
-                const data = await res.json();
-                
-                if(!res.ok) throw new Error(data.error || 'Fetch Error');
-                
-                document.getElementById('licBody').innerHTML = data.map(lic => {
-                    const friendlyName = ID_TO_NAME[lic.skuId] ? 
-                        \`<span style="font-weight:bold; color:#0078d4">\${ID_TO_NAME[lic.skuId]}</span>\` : 
-                        lic.skuPartNumber;
-                        
-                    const usagePercent = lic.total > 0 ? Math.round((lic.used / lic.total) * 100) : 0;
-                    const remaining = lic.total - lic.used;
-                    
-                    return \`
-                    <tr>
-                        <td>
-                            \${friendlyName}
-                            <div style="font-size:11px; color:#999; margin-top:2px;">\${lic.skuId}</div>
-                        </td>
-                        <td>\${lic.total}</td>
-                        <td>
-                            \${lic.used}
-                            <div class="progress-bar" title="\${usagePercent}%">
-                                <div class="progress-fill" style="width: \${usagePercent}%"></div>
-                            </div>
-                        </td>
-                        <td style="color: \${remaining < 5 ? '#d13438' : '#107c10'}; font-weight:bold;">
-                            \${remaining}
-                        </td>
-                    </tr>
-                    \`;
-                }).join('');
-
-            } catch(e) {
-                document.getElementById('licBody').innerHTML = \`<tr><td colspan="4" style="color:red; text-align:center;">查询失败: \${e.message}</td></tr>\`;
-            } finally {
-                document.getElementById('licLoading').style.display = 'none';
-            }
-        }
-
-        if(window.location.search.includes('token=')) loadUsers();
-    </script>
-</body>
-</html>
-`;
-
-export default {
-    async fetch(request, env) {
-        const url = new URL(request.url);
-
-        // --- A. 后台管理路由 (/admin) ---
-        if (url.pathname.startsWith('/admin')) {
-            const token = url.searchParams.get('token');
-            if (token !== env.ADMIN_TOKEN) {
-                return new Response('401 Unauthorized', { status: 401 });
-            }
-
-            if (url.pathname === '/admin' || url.pathname === '/admin/') {
-                return new Response(HTML_ADMIN_PAGE(env.SKU_MAP), { headers: { 'Content-Type': 'text/html;charset=UTF-8' } });
-            }
-
-            // API: 获取许可证列表 (新增)
-            if (url.pathname === '/admin/api/licenses' && request.method === 'GET') {
-                const accessToken = await getAccessToken(env);
-                const resp = await fetch('https://graph.microsoft.com/v1.0/subscribedSkus', {
-                    headers: { 'Authorization': `Bearer ${accessToken}` }
-                });
-                const data = await resp.json();
-                
-                // 格式化数据返回给前端
-                const result = data.value ? data.value.map(s => ({
-                    skuPartNumber: s.skuPartNumber, 
-                    skuId: s.skuId,                 
-                    total: s.prepaidUnits.enabled,  
-                    used: s.consumedUnits           
-                })) : [];
-                
-                return new Response(JSON.stringify(result), { status: resp.status, headers: { 'Content-Type': 'application/json' } });
-            }
-
-            // API: 获取用户列表
-            if (url.pathname === '/admin/api/users' && request.method === 'GET') {
-                const accessToken = await getAccessToken(env);
-                const graphUrl = 'https://graph.microsoft.com/v1.0/users?$select=id,displayName,userPrincipalName,createdDateTime,assignedLicenses&$top=100&$orderby=createdDateTime desc&$count=true';
-                debugLog(env, 'Fetching users from:', graphUrl);
-
-                const resp = await fetch(graphUrl, { 
-                    headers: { 'Authorization': `Bearer ${accessToken}`, 'ConsistencyLevel': 'eventual' } 
-                });
-                
-                const data = await resp.json();
-                
-                // 隐藏账户过滤
-                if (data.value && env.HIDDEN_USER) {
-                    data.value = data.value.filter(u => u.userPrincipalName.toLowerCase() !== env.HIDDEN_USER.toLowerCase());
-                }
-                
-                return new Response(JSON.stringify(data), { status: resp.status, headers: { 'Content-Type': 'application/json' } });
-            }
-
-            // API: 删除用户
-            if (url.pathname.match(/\/admin\/api\/users\/[^/]+$/) && request.method === 'DELETE') {
-                const userId = url.pathname.split('/').pop();
-                const accessToken = await getAccessToken(env);
-
-                if (env.HIDDEN_USER) {
-                    const checkResp = await fetch(`https://graph.microsoft.com/v1.0/users/${userId}?$select=userPrincipalName`, {
-                        headers: { 'Authorization': `Bearer ${accessToken}` }
-                    });
-                    if (checkResp.ok) {
-                        const checkUser = await checkResp.json();
-                        if (checkUser.userPrincipalName.toLowerCase() === env.HIDDEN_USER.toLowerCase()) {
-                            return new Response(JSON.stringify({error: 'Forbidden'}), { status: 403 });
-                        }
-                    }
-                }
-                const resp = await fetch(`https://graph.microsoft.com/v1.0/users/${userId}`, {
-                    method: 'DELETE',
-                    headers: { 'Authorization': `Bearer ${accessToken}` }
-                });
-                return new Response(null, { status: resp.status });
-            }
-
-            // API: 重置密码
-            if (url.pathname.endsWith('/password') && request.method === 'PATCH') {
-                const userId = url.pathname.split('/')[4]; 
-                const body = await request.json();
-                const accessToken = await getAccessToken(env);
-                
-                if (env.HIDDEN_USER) {
-                     const checkResp = await fetch(`https://graph.microsoft.com/v1.0/users/${userId}?$select=userPrincipalName`, {
-                        headers: { 'Authorization': `Bearer ${accessToken}` }
-                    });
-                    if (checkResp.ok && (await checkResp.json()).userPrincipalName.toLowerCase() === env.HIDDEN_USER.toLowerCase()) {
-                        return new Response(JSON.stringify({error: 'Forbidden'}), { status: 403 });
-                    }
-                }
-
-                const payload = { passwordProfile: { forceChangePasswordNextSignIn: false, password: body.password } };
-                const resp = await fetch(`https://graph.microsoft.com/v1.0/users/${userId}`, {
-                    method: 'PATCH',
-                    headers: { 'Authorization': `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
-                    body: JSON.stringify(payload)
-                });
-                return new Response(null, { status: resp.status });
-            }
-        }
-
-        // --- B. 前台注册路由 ---
-        if (request.method === 'GET') {
-            let skuOptions = [];
-            try {
-                const map = JSON.parse(env.SKU_MAP || '{}');
-                skuOptions = Object.keys(map);
-            } catch (e) { return new Response('Config Error: SKU_MAP is invalid', {status:500}); }
-            
-            return new Response(HTML_REGISTER_PAGE(env.TURNSTILE_SITE_KEY, skuOptions), {
-                headers: { 'Content-Type': 'text/html;charset=UTF-8' },
-            });
-        }
-
-        if (request.method === 'POST') {
-            try {
-                const formData = await request.formData();
-                const username = formData.get('username');
-                const password = formData.get('password');
-                const skuName = formData.get('skuName'); 
-                const turnstileToken = formData.get('cf-turnstile-response');
-                const ip = request.headers.get('CF-Connecting-IP');
-
-                debugLog(env, 'Register attempt:', username, ip);
-
-                const verifyRes = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ secret: env.CF_TURNSTILE_SECRET, response: turnstileToken, remoteip: ip })
-                });
-                if (!(await verifyRes.json()).success) return Response.json({ success: false, message: '人机验证失败，请刷新页面重试' });
-
-                let skuId = null;
-                try { skuId = JSON.parse(env.SKU_MAP || '{}')[skuName]; } catch(e){}
-                if (!skuId) return Response.json({ success: false, message: '请选择有效的订阅类型' });
-
-                if (!/^[a-zA-Z0-9]+$/.test(username)) return Response.json({ success: false, message: '用户名格式错误，仅允许字母和数字' });
-                
-                // 后端二次校验
-                if (password.toLowerCase().includes(username.toLowerCase())) {
-                    return Response.json({ success: false, message: '密码不能包含用户名（或用户名的部分）' });
-                }
-                if (!checkPasswordComplexity(password)) {
-                    return Response.json({ success: false, message: '密码需包含大小写/数字/符号中的至少3种' });
-                }
-
-                const accessToken = await getAccessToken(env);
-                const userEmail = `${username}@${env.DEFAULT_DOMAIN}`;
-
-                if (env.HIDDEN_USER && userEmail.toLowerCase() === env.HIDDEN_USER.toLowerCase()) {
-                     return Response.json({ success: false, message: '该用户名已被占用' });
-                }
-
-                const userPayload = {
-                    accountEnabled: true,
-                    displayName: username,
-                    mailNickname: username,
-                    userPrincipalName: userEmail,
-                    passwordProfile: { forceChangePasswordNextSignIn: false, password: password },
-                    usageLocation: "CN" 
-                };
-                
-                const createReq = await fetch('https://graph.microsoft.com/v1.0/users', {
-                    method: 'POST',
-                    headers: { 'Authorization': `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
-                    body: JSON.stringify(userPayload)
-                });
-
-                if (!createReq.ok) {
-                    const err = await createReq.json();
-                    debugLog(env, 'Create User Error:', err);
-                    
-                    const errMsg = err.error?.message || '';
-                    if (errMsg.includes('another object')) return Response.json({ success: false, message: '该用户名已被占用，请换一个试试' });
-                    if (errMsg.includes('Password cannot contain username')) return Response.json({ success: false, message: '创建失败：密码不能包含用户名' });
-                    if (errMsg.includes('PasswordProfile') || errMsg.includes('weak')) return Response.json({ success: false, message: '创建失败：密码过于简单或不符合策略' });
-
-                    throw new Error(errMsg);
-                }
-
-                const newUser = await createReq.json();
-
-                const licenseReq = await fetch(`https://graph.microsoft.com/v1.0/users/${newUser.id}/assignLicense`, {
-                    method: 'POST',
-                    headers: { 'Authorization': `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        addLicenses: [{ disabledPlans: [], skuId: skuId }],
-                        removeLicenses: []
-                    })
-                });
-
-                if (!licenseReq.ok) {
-                    const licErr = await licenseReq.json();
-                    return Response.json({ success: false, message: '账号创建成功但订阅分配失败: ' + licErr.error.message });
-                }
-
-                return Response.json({ success: true, email: userEmail });
-            } catch (e) {
-                return Response.json({ success: false, message: '系统繁忙或错误: ' + e.message });
-            }
-        }
-
-        return new Response('Method Not Allowed', { status: 405 });
+function jsonResponse(obj, status = 200, headers = {}) {
+  return new Response(JSON.stringify(obj), {
+    status,
+    headers: { 'Content-Type': 'application/json', ...headers },
+  });
+}
+
+function redirect(location, status = 302) {
+  return new Response(null, { status, headers: { Location: location } });
+}
+
+function parseCookies(req) {
+  const raw = req.headers.get('Cookie') || '';
+  return Object.fromEntries(
+    raw.split(';').map((c) => {
+      const [k, ...v] = c.trim().split('=');
+      return [k, v.join('=')];
+    }),
+  );
+}
+
+function mergeConfig(raw) {
+  const base = structuredClone(DEFAULT_CONFIG);
+  if (!raw || typeof raw !== 'object') return base;
+
+  const cfg = { ...base, ...raw };
+
+  cfg.turnstile = { ...base.turnstile, ...(raw.turnstile || {}) };
+  cfg.invite = { ...base.invite, ...(raw.invite || {}) };
+
+  cfg.globals = Array.isArray(raw.globals) ? raw.globals : base.globals;
+  cfg.protectedUsers = Array.isArray(raw.protectedUsers) ? raw.protectedUsers : base.protectedUsers;
+  cfg.protectedPrefixes = Array.isArray(raw.protectedPrefixes) ? raw.protectedPrefixes : base.protectedPrefixes;
+
+  cfg.adminUsername = (raw.adminUsername || base.adminUsername || 'admin').toString().trim() || 'admin';
+  cfg.adminPath = (raw.adminPath || base.adminPath || '/admin').toString().trim() || '/admin';
+  cfg.adminPasswordHash = (raw.adminPasswordHash || base.adminPasswordHash || '').toString();
+
+  return cfg;
+}
+
+async function getConfig(env) {
+  const cfg = await env.CONFIG_KV.get(KV.CONFIG, 'json');
+  return mergeConfig(cfg);
+}
+async function setConfig(env, cfg) {
+  await env.CONFIG_KV.put(KV.CONFIG, JSON.stringify(cfg));
+}
+
+async function ensureInvites(env) {
+  let data = await env.CONFIG_KV.get(KV.INVITES, 'json');
+  if (!data) {
+    const compat = await env.CONFIG_KV.get(KV.COMPAT_CARDS, 'json');
+    if (compat) {
+      await env.CONFIG_KV.put(KV.INVITES, JSON.stringify(compat));
+      data = compat;
+    } else {
+      await env.CONFIG_KV.put(KV.INVITES, JSON.stringify([]));
+      data = [];
     }
+  }
+  return data;
+}
+async function getInvites(env) {
+  const data = await env.CONFIG_KV.get(KV.INVITES, 'json');
+  if (data) return data;
+  return await ensureInvites(env);
+}
+async function saveInvites(env, list) {
+  await env.CONFIG_KV.put(KV.INVITES, JSON.stringify(list));
+}
+
+async function createSession(env) {
+  const token = crypto.randomUUID();
+  await env.CONFIG_KV.put(KV.SESS_PREFIX + token, Date.now().toString(), { expirationTtl: 60 * 60 * 6 });
+  return token;
+}
+async function verifySession(env, req) {
+  const cookies = parseCookies(req);
+  const token = cookies.ADMIN_SESSION;
+  if (!token) return false;
+  const val = await env.CONFIG_KV.get(KV.SESS_PREFIX + token);
+  return !!val;
+}
+
+function htmlResponse(html, status = 200) {
+  return new Response(html, { status, headers: { 'Content-Type': 'text/html;charset=UTF-8' } });
+}
+
+function sanitizeSkuMap(str) {
+  try {
+    const obj = typeof str === 'string' ? JSON.parse(str || '{}') : {};
+    if (typeof obj !== 'object' || Array.isArray(obj)) return {};
+    return obj;
+  } catch {
+    return {};
+  }
+}
+
+function disableSelectIfSingle(arr) {
+  return arr.length <= 1;
+}
+
+function checkPasswordComplexity(pwd){
+  if(!pwd || pwd.length<8) return false;
+  let s=0;
+  if(/[a-z]/.test(pwd)) s++;
+  if(/[A-Z]/.test(pwd)) s++;
+  if(/\d/.test(pwd)) s++;
+  if(/[^a-zA-Z0-9]/.test(pwd)) s++;
+  return s>=3;
+}
+
+/* -------------------- HTML Templates -------------------- */
+const baseStyles = `
+    :root {
+        --primary: #4f46e5;
+        --primary-hover: #4338ca;
+        --bg-gradient: linear-gradient(-45deg, #ee7752, #e73c7e, #23a6d5, #23d5ab);
+        --glass-bg: rgba(255, 255, 255, 0.9);
+        --glass-border: rgba(255, 255, 255, 0.4);
+        --text-main: #1f2937;
+        --text-sub: #6b7280;
+    }
+    * { box-sizing: border-box; }
+    body {
+        font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        background: var(--bg-gradient);
+        background-size: 400% 400%;
+        animation: gradient 15s ease infinite;
+        margin: 0; padding: 0;
+        color: var(--text-main);
+    }
+    @keyframes gradient { 0% {background-position:0% 50%} 50% {background-position:100% 50%} 100% {background-position:0% 50%} }
+    @keyframes fadeInUp { from {opacity:0; transform: translateY(20px);} to {opacity:1; transform: translateY(0);} }
+    a { color: var(--primary); text-decoration: none; }
+    .card {
+        background: var(--glass-bg);
+        backdrop-filter: blur(12px);
+        -webkit-backdrop-filter: blur(12px);
+        padding: 32px;
+        border-radius: 18px;
+        border: 1px solid var(--glass-border);
+        box-shadow: 0 15px 35px rgba(0,0,0,0.1), 0 5px 15px rgba(0,0,0,0.05);
+        animation: fadeInUp 0.6s;
+    }
+    button {
+        padding: 12px 14px;
+        background: var(--primary);
+        color: #fff;
+        border: none;
+        border-radius: 12px;
+        font-weight: 600;
+        cursor: pointer;
+        transition: all .2s;
+        box-shadow: 0 6px 14px rgba(79, 70, 229, 0.25);
+    }
+    button:hover { background: var(--primary-hover); transform: translateY(-1px); }
+    button:disabled { background: #9ca3af; cursor: not-allowed; box-shadow: none; }
+    input, select, textarea {
+        width: 100%;
+        padding: 12px 14px;
+        border: 2px solid #e5e7eb;
+        border-radius: 12px;
+        background: rgba(255,255,255,0.7);
+        font-size: 14px;
+        transition: all .2s;
+    }
+    input:focus, select:focus, textarea:focus {
+        outline: none;
+        border-color: var(--primary);
+        box-shadow: 0 0 0 4px rgba(79,70,229,0.12);
+        background: #fff;
+    }
+    .tag { padding: 4px 10px; border-radius: 12px; background: #e0e7ff; color: #4338ca; font-size: 12px; display:inline-block; margin: 2px 4px 2px 0;}
+    .table { width: 100%; border-collapse: separate; border-spacing: 0 8px; }
+    .table th { text-align: left; color: #6b7280; font-size: 12px; text-transform: uppercase; letter-spacing: .5px; cursor: pointer; user-select: none; }
+    .table th .arrow { margin-left:6px; color:#9ca3af; }
+    .table th.active .arrow { color: var(--primary); }
+    .table td { background: #fff; padding: 14px; border-radius: 12px; box-shadow: 0 1px 4px rgba(0,0,0,0.06); }
+    .toolbar { display:flex; gap:10px; flex-wrap: wrap; margin-bottom: 14px; }
+    .pill { padding: 6px 10px; border: 1px solid #e5e7eb; border-radius: 999px; font-size: 12px; background:#fff; cursor:pointer; }
+    .pill.active { border-color: var(--primary); color: var(--primary); background: #eef2ff; }
+    .chip { padding:4px 8px; border-radius:10px; background:#eef2ff; color:#4338ca; font-size:12px; }
+    .input-compact {max-width:220px;}
+    .flex-row {display:flex; gap:10px; flex-wrap:wrap; align-items:center;}
+
+    @media (max-width: 480px) {
+        body { padding: 12px; }
+        .card { padding: 20px; border-radius: 16px; }
+        button { width: 100%; }
+    }
+`;
+
+const GITHUB_ICON = `<svg viewBox="0 0 16 16" version="1.1" width="18" height="18" aria-hidden="true" fill="currentColor" style="vertical-align:middle;"><path d="M8 0C3.58 0 0 3.58 0 8a8 8 0 0 0 5.47 7.59c.4.07.55-.17.55-.38l-.01-1.49C3.99 14.91 3.48 13.5 3.48 13.5c-.36-.92-.88-1.17-.88-1.17-.72-.5.06-.49.06-.49.79.06 1.2.82 1.2.82.71 1.21 1.86.86 2.31.66.07-.52.28-.86.5-1.06-2-.22-4.1-1-4.1-4.43 0-.98.35-1.78.92-2.41-.09-.22-.4-1.11.09-2.31 0 0 .76-.24 2.49.92a8.64 8.64 0 0 1 4.53 0c1.72-1.16 2.48-.92 2.48-.92.5 1.2.19 2.09.1 2.31.57.63.92 1.43.92 2.41 0 3.44-2.1 4.2-4.11 4.42.29.25.54.73.54 1.48l-.01 2.2c0 .21.15.46.55.38A8 8 0 0 0 16 8c0-4.42-3.58-8-8-8z"></path></svg>`;
+
+/* Public register page (no admin-query APIs exposed) */
+function renderRegisterPage({
+  globals,
+  selectedGlobalId,
+  skuDisplayList,
+  protectedPrefixes,
+  turnstileSiteKey,
+  inviteMode,
+  adminPath,
+}) {
+  const disableGlobal = disableSelectIfSingle(globals);
+  const selectedGlobal = globals.find(g => g.id === selectedGlobalId) || globals[0] || null;
+  const disableSku = disableSelectIfSingle(skuDisplayList);
+
+  const globalOptions = globals
+    .map((g) => {
+      const sel = selectedGlobal && g.id === selectedGlobal.id ? 'selected' : '';
+      return `<div class="option ${sel}" data-id="${g.id}">${g.label}</div>`;
+    })
+    .join('');
+
+  const skuOptions = (list) =>
+    (list || [])
+      .map((x) => `<div class="option" data-value="${x.name}">${x.label}</div>`)
+      .join('');
+
+  const siteKeyScript = turnstileSiteKey
+    ? `<script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>`
+    : '';
+
+  const initialSkuName = skuDisplayList?.[0]?.name || '';
+  const initialSkuLabel = skuDisplayList?.[0]?.label || '暂无 SKU';
+
+  return `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>${inviteMode ? 'Office365 邀请码自助注册' : 'Office 365 自助开通'}</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>${baseStyles}
+html,body{max-width:100%;overflow-x:hidden;}
+body{display:flex;justify-content:center;align-items:center;min-height:100vh;padding:20px;}
+.card{max-width:520px;width:100%;position:relative;}
+.header-row{display:flex;justify-content:space-between;align-items:center;margin-bottom:18px;gap:10px;flex-wrap:wrap;}
+h2{margin:0;font-weight:800;color:#111;font-size:20px;}
+.label{font-size:13px;font-weight:700;color:#6b7280;margin-bottom:6px;display:block;}
+.hint{margin-top:6px;font-size:12px;line-height:1.5;color:#6b7280;}
+.hint.error{color:#b91c1c;font-weight:800;}
+.custom-select{position:relative;}
+.select-trigger{border:2px solid #e5e7eb;border-radius:12px;padding:12px 14px;display:flex;justify-content:space-between;align-items:center;background:rgba(255,255,255,0.7);cursor:pointer;gap:10px;}
+.select-trigger span{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.select-trigger.disabled{cursor:not-allowed;opacity:0.6;}
+.select-arrow{flex:0 0 auto;width:10px;height:10px;border-right:2px solid #6b7280;border-bottom:2px solid #6b7280;transform:rotate(45deg) translateY(-2px);}
+.options-container{position:absolute;top:105%;left:0;right:0;background:white;border-radius:12px;box-shadow:0 10px 25px rgba(0,0,0,0.1);opacity:0;visibility:hidden;transform:translateY(-6px);transition:all .2s;z-index:50;overflow:hidden;max-height:48vh;overflow-y:auto;}
+.options-container.open{opacity:1;visibility:visible;transform:translateY(0);}
+.option{padding:12px 14px;font-size:14px;cursor:pointer;word-break:break-word;}
+.option:hover{background:#f3f4f6;color:var(--primary);}
+.option.selected{background:#e0e7ff;color:var(--primary);font-weight:800;}
+.message{margin-top:14px;padding:12px;border-radius:10px;font-size:13px;display:none;}
+.error{background:#fee2e2;color:#991b1b;border:1px solid #fecaca;}
+.success{background:#dcfce7;color:#166534;border:1px solid #bbf7d0;}
+.cf-turnstile{display:flex;justify-content:center;margin:16px 0;}
+.footer{margin-top:16px;font-size:12px;color:#6b7280;display:flex;gap:6px;align-items:center;justify-content:center;flex-wrap:wrap;text-align:center;}
+.icon-link{display:flex;gap:6px;align-items:center;color:#6b7280;}
+
+/* 威慑性弹窗 */
+.danger-modal{position:fixed;top:0;left:0;width:100%;height:100%;display:none;align-items:center;justify-content:center;background:rgba(0,0,0,0.55);backdrop-filter:blur(4px);z-index:2000;padding:14px;}
+.danger-modal .dlg{width:92vw;max-width:520px;background:#fff;border-radius:18px;box-shadow:0 18px 50px rgba(0,0,0,0.35);overflow:hidden;}
+.danger-modal .bar{background:#b91c1c;color:#fff;padding:14px 16px;font-weight:900;display:flex;align-items:center;justify-content:space-between;}
+.danger-modal .bar .x{width:34px;height:34px;border-radius:12px;background:rgba(255,255,255,0.18);display:flex;align-items:center;justify-content:center;font-weight:900;cursor:pointer;}
+.danger-modal .content{padding:16px;line-height:1.7;color:#111827;}
+.danger-modal .content strong{color:#b91c1c;}
+.danger-modal .actions{padding:0 16px 16px;display:flex;gap:10px;}
+.danger-modal .actions button{width:100%;background:#b91c1c;}
+.danger-modal .actions button:hover{background:#991b1b;transform:none;}
+
+@media (max-width: 480px) {
+  body{padding:12px;}
+  .card{padding:20px;border-radius:16px;}
+  button{width:100%;}
+}
+</style>
+${siteKeyScript}
+</head>
+<body>
+
+<div class="danger-modal" id="banModal" role="dialog" aria-modal="true">
+  <div class="dlg">
+    <div class="bar">
+      <span>⚠️ 安全拦截</span>
+      <span class="x" onclick="hideBan()">✕</span>
+    </div>
+    <div class="content">
+      <div style="font-size:16px;font-weight:900;margin-bottom:8px;">该用户名被<strong>禁止注册</strong>！</div>
+      <div>请勿尝试注册<strong>非法/敏感</strong>用户名，否则系统将持续拦截并记录行为。</div>
+      <div style="margin-top:10px;color:#6b7280;font-size:12px;">建议更换一个普通用户名（仅字母/数字）。</div>
+    </div>
+    <div class="actions">
+      <button type="button" onclick="hideBan()">我已知晓</button>
+    </div>
+  </div>
+</div>
+
+<div class="card">
+  <div class="header-row">
+    <h2>${inviteMode ? 'Office365 邀请码自助注册' : 'Office 365 自助开通'}</h2>
+    <a class="icon-link" href="${GITHUB_LINK}" target="_blank" title="View Source">${GITHUB_ICON}</a>
+  </div>
+
+  <form id="regForm">
+    <input type="hidden" name="globalId" id="globalId" value="${selectedGlobal ? selectedGlobal.id : ''}">
+    <input type="hidden" name="skuName" id="skuName" value="${initialSkuName}">
+
+    <div class="input-group">
+      <span class="label">选择全局</span>
+      <div class="custom-select">
+        <div class="select-trigger ${disableGlobal ? 'disabled' : ''}" id="globalTrigger">
+          <span>${selectedGlobal ? selectedGlobal.label : '无可用全局'}</span>
+          <div class="select-arrow"></div>
+        </div>
+        <div class="options-container" id="globalOptions">${globalOptions}</div>
+      </div>
+      <div class="hint">切换全局会自动刷新页面以获取对应订阅余量。</div>
+    </div>
+
+    <div class="input-group">
+      <span class="label">选择订阅类型</span>
+      <div class="custom-select">
+        <div class="select-trigger ${disableSku ? 'disabled' : ''}" id="skuTrigger">
+          <span>${initialSkuLabel}</span>
+          <div class="select-arrow"></div>
+        </div>
+        <div class="options-container" id="skuOptions">${skuOptions(skuDisplayList)}</div>
+      </div>
+    </div>
+
+    <div class="input-group">
+      <span class="label">用户名 (仅字母和数字)</span>
+      <input type="text" id="username" required pattern="[a-zA-Z0-9]+" placeholder="例如: user123" autocomplete="off">
+      <div class="hint" id="userHint"></div>
+    </div>
+    <div class="input-group">
+      <span class="label">密码（8位+，大写/小写/数字/符号：4选3）</span>
+      <input type="password" id="password" required placeholder="设置强密码" autocomplete="new-password">
+      <div class="hint" id="pwdHint">密码需满足：长度 ≥ 8，且大写/小写/数字/符号四类中满足任意三类。</div>
+    </div>
+
+    ${
+      inviteMode
+        ? `<div class="input-group">
+            <span class="label">邀请码</span>
+            <input type="text" id="inviteCode" required placeholder="请输入有效邀请码">
+           </div>`
+        : ''
+    }
+
+    ${turnstileSiteKey ? `<div class="cf-turnstile" data-sitekey="${turnstileSiteKey}"></div>` : ''}
+
+    <button type="submit" id="btn">立即创建账号</button>
+    <div id="msg" class="message"></div>
+  </form>
+
+  <div class="footer">
+    <span>Powered by Cloudflare Workers</span>
+    <a class="icon-link" href="${GITHUB_LINK}" target="_blank">${GITHUB_ICON} CF-M365-Admin</a>
+    <a class="icon-link" href="${adminPath}/login"> | ⭐后台管理⭐</a>
+  </div>
+</div>
+
+<script>
+  const globals = ${JSON.stringify(globals)};
+  const selectedGlobalId = ${JSON.stringify(selectedGlobal ? selectedGlobal.id : '')};
+  const protectedPrefixes = ${JSON.stringify((protectedPrefixes || []).map(s=>String(s).toLowerCase()))};
+  const inviteMode = ${inviteMode ? 'true' : 'false'};
+  const turnstileOn = ${turnstileSiteKey ? 'true' : 'false'};
+
+  function openSelect(triggerId, containerId, disabled) {
+    const trigger = document.getElementById(triggerId);
+    const container = document.getElementById(containerId);
+    if (disabled) { trigger.classList.add('disabled'); return; }
+    trigger.addEventListener('click', (e) => {
+      e.stopPropagation();
+      container.classList.toggle('open');
+    });
+    document.addEventListener('click', () => container.classList.remove('open'));
+  }
+
+  openSelect('globalTrigger', 'globalOptions', ${disableGlobal ? 'true' : 'false'});
+  openSelect('skuTrigger', 'skuOptions', ${disableSku ? 'true' : 'false'});
+
+  // 切换全局：直接刷新页面（避免暴露后台查询 API）
+  document.querySelectorAll('#globalOptions .option').forEach(opt => {
+    opt.addEventListener('click', () => {
+      const gid = opt.getAttribute('data-id');
+      if (!gid || gid === selectedGlobalId) return;
+      const u = new URL(location.href);
+      u.searchParams.set('g', gid);
+      location.href = u.toString();
+    });
+  });
+
+  // SKU 选择
+  document.querySelectorAll('#skuOptions .option').forEach(opt => {
+    opt.addEventListener('click', () => {
+      const v = opt.getAttribute('data-value');
+      document.getElementById('skuName').value = v || '';
+      document.getElementById('skuTrigger').querySelector('span').innerText = opt.innerText;
+      document.getElementById('skuOptions').classList.remove('open');
+    });
+  });
+
+  function showBan(){ document.getElementById('banModal').style.display='flex'; }
+  function hideBan(){ document.getElementById('banModal').style.display='none'; }
+
+  function checkComplexity(pwd) {
+    if(!pwd || pwd.length < 8) return false;
+    let s=0; if(/[a-z]/.test(pwd))s++; if(/[A-Z]/.test(pwd))s++; if(/\\d/.test(pwd))s++; if(/[^a-zA-Z0-9]/.test(pwd))s++;
+    return s>=3;
+  }
+
+  function isBannedUsername(name){
+    const u = (name||'').trim().toLowerCase();
+    if(!u) return false;
+    return protectedPrefixes.includes(u);
+  }
+
+  const btn = document.getElementById('btn');
+  const userEl = document.getElementById('username');
+  const pwdEl = document.getElementById('password');
+  const userHint = document.getElementById('userHint');
+  const pwdHint = document.getElementById('pwdHint');
+
+  function validateForm(){
+    const username = userEl.value.trim();
+    const password = pwdEl.value || '';
+    let ok = true;
+
+    // username format
+    if(username && !/^[a-zA-Z0-9]+$/.test(username)){
+      userHint.className='hint error';
+      userHint.innerText='用户名只能包含字母和数字。';
+      ok=false;
+    } else if(isBannedUsername(username)){
+      userHint.className='hint error';
+      userHint.innerText='该用户名属于敏感/高危用户名，禁止注册。';
+      ok=false;
+    } else {
+      userHint.className='hint';
+      userHint.innerText='';
+    }
+
+    // password complexity
+    if(password && !checkComplexity(password)){
+      pwdHint.className='hint error';
+      pwdHint.innerText='密码不符合要求：长度≥8，且大写/小写/数字/符号四类中满足任意三类。';
+      ok=false;
+    } else {
+      pwdHint.className='hint';
+      pwdHint.innerText='密码需满足：长度 ≥ 8，且大写/小写/数字/符号四类中满足任意三类。';
+    }
+
+    // password contains username
+    if(username && password && password.toLowerCase().includes(username.toLowerCase())){
+      pwdHint.className='hint error';
+      pwdHint.innerText='密码不能包含用户名（大小写不敏感）。';
+      ok=false;
+    }
+
+    // required selections
+    const globalId = document.getElementById('globalId').value;
+    const skuName = document.getElementById('skuName').value;
+    if(!globalId || !skuName) ok=false;
+
+    btn.disabled = !ok;
+    return ok;
+  }
+
+  userEl.addEventListener('input', validateForm);
+  pwdEl.addEventListener('input', validateForm);
+  validateForm();
+
+  document.getElementById('regForm').addEventListener('submit', async (e)=>{
+    e.preventDefault();
+    const msg = document.getElementById('msg');
+
+    const username = userEl.value.trim();
+    if(isBannedUsername(username)){
+      showBan();
+      msg.className='message error';
+      msg.style.display='block';
+      msg.innerText='❌ 该用户名被禁止注册！请勿尝试注册非法用户名！';
+      return;
+    }
+    if(!validateForm()){
+      msg.className='message error';
+      msg.style.display='block';
+      msg.innerText='❌ 请先修正表单错误后再提交。';
+      return;
+    }
+
+    const password = pwdEl.value;
+    const skuName = document.getElementById('skuName').value;
+    const globalId = document.getElementById('globalId').value;
+    const inviteCode = inviteMode ? document.getElementById('inviteCode').value.trim() : '';
+
+    if(inviteMode && !inviteCode){ msg.className='message error'; msg.style.display='block'; msg.innerText='请填写邀请码'; return; }
+
+    btn.disabled = true; btn.innerText = '正在创建...';
+    msg.style.display='none';
+
+    const form = new FormData();
+    form.append('username', username);
+    form.append('password', password);
+    form.append('skuName', skuName);
+    form.append('globalId', globalId);
+    if(inviteMode) form.append('inviteCode', inviteCode);
+    if(turnstileOn){
+      const v = document.querySelector('[name="cf-turnstile-response"]');
+      form.append('cf-turnstile-response', v ? v.value : '');
+    }
+
+    try{
+      const res = await fetch('/', { method:'POST', body: form });
+      const data = await res.json();
+      msg.style.display='block';
+      if(data.success){
+        msg.className='message success';
+        msg.innerHTML = '🎉 开通成功！<br>账号: '+data.email+'<br>密码: (您刚才设置的)<br><a href="https://portal.office.com" target="_blank" style="color:#166534;font-weight:900;">前往 Office.com 登录</a>';
+        document.getElementById('regForm').reset();
+      }else{
+        msg.className='message error';
+        msg.innerText = '❌ '+(data.message||'失败');
+        if((data.message||'').includes('禁止注册')){ showBan(); }
+      }
+      if(turnstileOn && typeof turnstile!=='undefined') turnstile.reset();
+    }catch(err){
+      msg.className='message error'; msg.style.display='block'; msg.innerText='网络异常，请稍后重试';
+    }finally{ btn.disabled=false; btn.innerText='立即创建账号'; validateForm(); }
+  });
+
+  // Expose for inline handler
+  window.hideBan = hideBan;
+</script>
+</body></html>`;
+}
+
+/* Admin layout */
+function adminLayout({ title, content, adminPath, active }) {
+  return `<!DOCTYPE html><html lang="zh-CN"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${title}</title>
+<style>${baseStyles}
+html,body{max-width:100%;overflow-x:hidden;}
+body{background:#f4f5fb;padding:0;margin:0;}
+.nav{background:#fff;box-shadow:0 2px 10px rgba(0,0,0,0.05);padding:14px 22px;display:flex;align-items:center;justify-content:space-between;}
+.nav-left{display:flex;align-items:center;gap:14px;}
+.nav a{color:#4b5563;font-weight:600;}
+.tabs{display:flex;gap:10px;}
+.tab{padding:10px 14px;border-radius:10px;background:#f3f4f6;color:#374151;text-decoration:none;font-weight:600;}
+.tab.active{background:var(--primary);color:#fff;box-shadow:0 6px 14px rgba(79,70,229,0.18);}
+.container{max-width:1200px;margin:24px auto;padding:0 16px;}
+.section{background:#fff;border-radius:16px;box-shadow:0 12px 30px rgba(0,0,0,0.08);padding:24px;margin-bottom:18px;}
+.badge{padding:4px 8px;border-radius:8px;background:#eef2ff;color:#4338ca;font-weight:700;font-size:12px;}
+.table-wrap{overflow-x:auto;}
+input[type=checkbox]{width:16px;height:16px;}
+.modal{position:fixed;top:0;left:0;width:100%;height:100%;display:none;align-items:center;justify-content:center;background:rgba(0,0,0,0.35);backdrop-filter:blur(3px);z-index:1000;}
+.modal .dialog{background:#fff;border-radius:16px;padding:20px;min-width:320px;max-width:92vw;max-height:85vh;overflow:auto;box-shadow:0 15px 40px rgba(0,0,0,0.2);animation:fadeInUp .25s;}
+.modal .header{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;}
+.modal .footer{display:flex;justify-content:flex-end;gap:10px;margin-top:14px;}
+.modal-close{width:32px;height:32px;padding:0;border-radius:10px;background:#e5e7eb;color:#374151;display:flex;align-items:center;justify-content:center;font-weight:900;line-height:1;}
+.modal-close:hover{background:#d1d5db;transform:none;}
+.btn-ghost{background:#e5e7eb;color:#374151;}
+.btn-danger{background:#d13438;}
+label.inline{display:flex;align-items:center;gap:8px;margin:6px 0;}
+.pagination{display:flex;align-items:center;gap:8px;flex-wrap:wrap;}
+.page-input{width:90px;}
+.search-box{display:flex;gap:8px;flex-wrap:wrap;align-items:center;}
+
+/* -------- Responsive (mobile) -------- */
+@media (max-width: 720px){
+  .nav{flex-direction:column;align-items:flex-start;gap:10px;padding:12px 14px;}
+  .nav-left{flex-wrap:wrap;gap:10px;}
+  .tabs{width:100%;flex-wrap:wrap;gap:8px;}
+  .tab{flex:1 1 auto;text-align:center;padding:10px 12px;}
+  .container{margin:16px auto;padding:0 12px;}
+  .section{padding:16px;}
+  .input-compact{max-width:100%;}
+  .modal .dialog{min-width:unset;width:92vw;}
+  .toolbar{gap:8px;}
+  .toolbar button{padding:10px 12px;font-size:13px;}
+  .toolbar input,.toolbar select{padding:10px 12px;font-size:13px;}
+  .search-box{width:100%;}
+  .pagination{gap:6px;}
+  .page-input{width:78px;}
+}
+
+/* Responsive tables -> stack rows into cards */
+@media (max-width: 720px){
+  .table-wrap{overflow-x:visible;}
+  .table{border-spacing:0 12px;}
+  .table thead{display:none;}
+  .table tr{display:block;background:#fff;border-radius:14px;box-shadow:0 1px 6px rgba(0,0,0,0.08);overflow:hidden;}
+  .table td{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;width:100%;background:transparent;box-shadow:none;border-radius:0;padding:10px 14px;word-break:break-word;}
+  .table td:not(:last-child){border-bottom:1px solid #f3f4f6;}
+  .table td::before{content:attr(data-label);font-weight:800;color:#6b7280;font-size:12px;min-width:92px;}
+  .table td:first-child{justify-content:flex-start;}
+  .table td:first-child::before{content:'';min-width:0;}
+  .table td code{word-break:break-all;}
+  .tag{white-space:normal;}
+}
+</style>
+</head><body>
+<div class="nav">
+  <div class="nav-left">
+    <span style="font-weight:800;font-size:16px;">⚡ Office 365 Admin</span>
+    <span class="badge">安全模式</span>
+    <a href="https://github.com/zixiwangluo/CF-M365-Admin" target="_blank" style="display:flex;align-items:center;gap:6px;">${GITHUB_ICON}<span>GitHub CF-M365-Admin</span></a>
+  </div>
+  <div class="tabs">
+    <a class="tab ${active==='users'?'active':''}" href="${adminPath}/users">用户</a>
+    <a class="tab ${active==='globals'?'active':''}" href="${adminPath}/globals">全局账户</a>
+    <a class="tab ${active==='invites'?'active':''}" href="${adminPath}/invites">邀请码</a>
+    <a class="tab ${active==='settings'?'active':''}" href="${adminPath}/settings">设置</a>
+  </div>
+</div>
+<div class="container">
+${content}
+</div>
+</body></html>`;
+}
+
+/* Setup page */
+function renderSetup(adminPath) {
+  return `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>初始化安装</title>
+<style>${baseStyles}
+body{display:flex;justify-content:center;align-items:center;min-height:100vh;padding:20px;}
+.card{width:100%;max-width:520px;}
+h2{margin:0 0 12px 0;}
+.desc{color:#6b7280;font-size:14px;margin-bottom:16px;}
+.row{margin-bottom:14px;}
+.helper{font-size:12px;color:#6b7280;margin-top:6px;line-height:1.5;}
+</style></head><body>
+<div class="card">
+  <h2>首次安装</h2>
+  <div class="desc">设置后台用户名、密码与自定义后台路径。保存后会写入 KV 并上锁。</div>
+  <form id="setupForm">
+    <div class="row">
+      <span class="label">管理员用户名</span>
+      <input type="text" id="user" required placeholder="例如：admin" pattern="[a-zA-Z0-9_\-]{3,32}">
+      <div class="helper">3-32 位，仅字母/数字/_/-</div>
+    </div>
+    <div class="row">
+      <span class="label">管理员密码</span>
+      <input type="password" id="pwd" required placeholder="至少 8 位强密码">
+    </div>
+    <div class="row">
+      <span class="label">后台路径 (例如 /admin)</span>
+      <input type="text" id="path" value="${adminPath}" required pattern="\/[a-zA-Z0-9\-_/]+">
+    </div>
+    <button type="submit" id="btn">保存并进入后台</button>
+  </form>
+  <div id="msg" class="message" style="display:none;"></div>
+  <div class="footer" style="margin-top:14px;display:flex;gap:8px;flex-wrap:wrap;align-items:center;">${GITHUB_ICON}<a href="https://github.com/zixiwangluo/CF-M365-Admin" target="_blank">CF-M365-Admin</a></div>
+</div>
+<script>
+document.getElementById('setupForm').addEventListener('submit', async (e)=>{
+  e.preventDefault();
+  const username = (document.getElementById('user').value || '').trim();
+  const pwd = document.getElementById('pwd').value;
+  const path = (document.getElementById('path').value || '/admin').trim();
+  const btn = document.getElementById('btn');
+  const msg = document.getElementById('msg');
+
+  if(!/^[a-zA-Z0-9_\-]{3,32}$/.test(username)){
+    msg.innerText='用户名格式不正确（3-32位，仅字母/数字/_/-）';
+    msg.className='message error'; msg.style.display='block'; return;
+  }
+  if(!pwd || pwd.length<8){
+    msg.innerText='密码至少 8 位';
+    msg.className='message error'; msg.style.display='block'; return;
+  }
+  btn.disabled=true; btn.innerText='正在保存...';
+  msg.style.display='none';
+
+  const res = await fetch('${adminPath}/setup',{
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({username, password:pwd, adminPath:path})
+  });
+  const data = await res.json();
+  if(data.success){ window.location.href = path + '/login'; }
+  else {
+    msg.className='message error'; msg.style.display='block';
+    msg.innerText=data.message||'保存失败';
+    btn.disabled=false; btn.innerText='保存并进入后台';
+  }
+});
+</script>
+</body></html>`;
+}
+
+/* Login page */
+function renderLogin(adminPath) {
+  return `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>登录后台</title>
+<style>${baseStyles}
+body{display:flex;align-items:center;justify-content:center;min-height:100vh;padding:20px;}
+.card{max-width:440px;width:100%;}
+.row{margin-bottom:12px;}
+</style></head><body>
+<div class="card">
+  <div class="header-row" style="margin-bottom:10px;">
+    <h2>后台登录</h2>
+    <a href="https://github.com/zixiwangluo/CF-M365-Admin" class="icon-link" target="_blank">${GITHUB_ICON}</a>
+  </div>
+  <form id="loginForm">
+    <div class="row">
+      <span class="label">用户名</span>
+      <input type="text" id="user" required placeholder="请输入后台用户名">
+    </div>
+    <div class="row">
+      <span class="label">密码</span>
+      <input type="password" id="pwd" required placeholder="请输入后台密码">
+    </div>
+    <button type="submit" id="btn" style="margin-top:8px;">登录</button>
+  </form>
+  <div id="msg" class="message" style="display:none;"></div>
+</div>
+<script>
+document.getElementById('loginForm').addEventListener('submit', async (e)=>{
+  e.preventDefault();
+  const username = (document.getElementById('user').value||'').trim();
+  const pwd = document.getElementById('pwd').value;
+  const btn = document.getElementById('btn');
+  const msg = document.getElementById('msg');
+  btn.disabled=true; btn.innerText='验证中...';
+  msg.style.display='none';
+  const res = await fetch('${adminPath}/login',{
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({username, password:pwd})
+  });
+  const data = await res.json();
+  if(data.success){ window.location.href='${adminPath}/users'; }
+  else {
+    msg.className='message error'; msg.style.display='block';
+    msg.innerText=data.message||'登录失败';
+    btn.disabled=false; btn.innerText='登录';
+  }
+});
+</script>
+</body></html>`;
+}
+
+/* Admin pages */
+function renderUsersPage(adminPath) {
+  return adminLayout({
+    title: '用户管理',
+    adminPath,
+    active: 'users',
+    content: `
+<div class="section">
+  <div class="toolbar">
+    <button id="btnRefresh">🔄 刷新</button>
+    <button id="btnLic">📊 查看订阅</button>
+    <button id="btnPwd">🔑 重置密码</button>
+    <button id="btnDel" class="btn-danger">🗑️ 批量删除</button>
+  </div>
+  <div class="toolbar" id="globalFilters"></div>
+  <div class="toolbar search-box">
+    <span class="label" style="margin:0;">筛选/搜索：</span>
+    <select id="searchField" class="input-compact">
+      <option value="displayName">用户名</option>
+      <option value="userPrincipalName">账号</option>
+      <option value="license">订阅</option>
+      <option value="_globalLabel">全局</option>
+    </select>
+    <input id="searchText" class="input-compact" placeholder="输入关键词，支持模糊">
+    <button id="btnSearch" class="btn-ghost">搜索</button>
+    <button id="btnClear" class="btn-ghost">清空</button>
+  </div>
+  <div class="pagination" style="margin:4px 0;">
+    <span class="label" style="margin:0;">分页:</span>
+    <select id="pageSize">
+      <option value="20" selected>20/页</option>
+      <option value="30">30/页</option>
+      <option value="50">50/页</option>
+      <option value="100">100/页</option>
+    </select>
+    <span id="pageInfo"></span>
+    <button id="prevPage">上一页</button>
+    <button id="nextPage">下一页</button>
+    <input class="page-input" id="jumpPage" type="number" min="1" placeholder="页码">
+    <button id="goPage">跳转</button>
+  </div>
+  <div id="status" style="color:#107c10;font-weight:700;margin-bottom:6px;"></div>
+  <div class="table-wrap">
+    <table class="table" id="userTable">
+      <thead>
+        <tr>
+          <th><input type="checkbox" id="chkAll"></th>
+          <th data-sort="displayName">用户名 <span class="arrow" id="arr-displayName">↕</span></th>
+          <th data-sort="userPrincipalName">账号 <span class="arrow" id="arr-userPrincipalName">↕</span></th>
+          <th data-sort="_licSort">订阅 <span class="arrow" id="arr-_licSort">↕</span></th>
+          <th data-sort="createdDateTime">创建时间 <span class="arrow" id="arr-createdDateTime">↕</span></th>
+          <th data-sort="_globalLabel">全局 <span class="arrow" id="arr-_globalLabel">↕</span></th>
+          <th>UUID</th>
+        </tr>
+      </thead>
+      <tbody id="userBody"></tbody>
+    </table>
+  </div>
+</div>
+
+<div class="modal" id="modalPwd">
+  <div class="dialog" style="max-width:420px;">
+    <div class="header"><h3 style="margin:0;">重置密码</h3><button class="modal-close" onclick="closeModal('modalPwd')" aria-label="Close">✕</button></div>
+    <div>
+      <label class="inline"><input type="radio" name="pwdType" value="auto" checked> 自动生成高强度密码</label>
+      <label class="inline"><input type="radio" name="pwdType" value="custom"> 自定义密码</label>
+      <input type="text" id="customPwd" style="display:none;margin-top:8px;" placeholder="输入新密码">
+    </div>
+    <div class="footer">
+      <button class="btn-ghost" onclick="closeModal('modalPwd')">取消</button>
+      <button id="confirmPwd">确认</button>
+    </div>
+    <div id="pwdResult" style="font-size:12px;color:#1f2937;margin-top:10px;"></div>
+  </div>
+</div>
+
+<div class="modal" id="modalLic">
+  <div class="dialog" style="max-width:520px;">
+    <div class="header"><h3 style="margin:0;">订阅余量</h3><button class="modal-close" onclick="closeModal('modalLic')" aria-label="Close">✕</button></div>
+    <div id="licContent">加载中...</div>
+  </div>
+</div>
+
+<script>
+const adminPath = '${adminPath}';
+let globalsCache = [];
+let usersCache = [];
+let sortKey = 'displayName';
+let sortDir = 1; // asc by default
+let currentPage = 1;
+let pageSize = 20;
+let filterGlobal = 'ALL';
+let searchField = 'displayName';
+let searchText = '';
+
+function closeModal(id){ document.getElementById(id).style.display='none'; }
+function openModal(id){ document.getElementById(id).style.display='flex'; }
+
+function updateArrows(){
+  document.querySelectorAll('#userTable th[data-sort]').forEach(th=>{
+    const key=th.getAttribute('data-sort');
+    th.classList.remove('active');
+    const arrow = document.getElementById('arr-'+key);
+    if(arrow) arrow.innerText='↕';
+    if(key===sortKey){
+      th.classList.add('active');
+      if(arrow) arrow.innerText = sortDir===1 ? '↑' : '↓';
+    }
+  });
+}
+
+function renderGlobalsFilter(){
+  const wrap = document.getElementById('globalFilters');
+  wrap.innerHTML = '<span class="label" style="margin:0;">按全局筛选：</span>';
+  const allPill = document.createElement('div');
+  allPill.className='pill active'; allPill.innerText='全部';
+  allPill.onclick=()=>{ filterGlobal='ALL'; document.querySelectorAll('.pill').forEach(p=>p.classList.remove('active')); allPill.classList.add('active'); renderUserRows(); };
+  wrap.appendChild(allPill);
+  globalsCache.forEach(g=>{
+    const pill=document.createElement('div'); pill.className='pill'; pill.innerText=g.label;
+    pill.onclick=()=>{ filterGlobal=g.id; document.querySelectorAll('.pill').forEach(p=>p.classList.remove('active')); pill.classList.add('active'); renderUserRows(); };
+    wrap.appendChild(pill);
+  });
+}
+
+function applyFilterSort(list){
+  let data = [...list];
+  if(filterGlobal!=='ALL') data = data.filter(u=>u._globalId===filterGlobal);
+  if(searchText){
+    const txt = searchText.toLowerCase();
+    data = data.filter(u=>{
+      if(searchField==='displayName') return (u.displayName||'').toLowerCase().includes(txt);
+      if(searchField==='userPrincipalName') return (u.userPrincipalName||'').toLowerCase().includes(txt);
+      if(searchField==='_globalLabel') return (u._globalLabel||'').toLowerCase().includes(txt);
+      if(searchField==='license'){
+        return (u._licSort||'').toLowerCase().includes(txt);
+      }
+      return true;
+    });
+  }
+  data.sort((a,b)=>{
+    const va = a[sortKey] || '';
+    const vb = b[sortKey] || '';
+    if(typeof va === 'string') return sortDir * va.localeCompare(vb, 'zh-CN');
+    return sortDir * ((va>vb)-(va<vb));
+  });
+  return data;
+}
+
+function renderUserRows(){
+  updateArrows();
+  const body=document.getElementById('userBody');
+  const data = applyFilterSort(usersCache);
+  const total = data.length;
+  const totalPages = Math.max(1, Math.ceil(total / pageSize));
+  currentPage = Math.min(currentPage, totalPages);
+  const start = (currentPage-1)*pageSize;
+  const pageData = data.slice(start, start+pageSize);
+
+  if(!pageData.length){ body.innerHTML='<tr><td colspan="7" style="text-align:center;">暂无数据</td></tr>'; }
+  else {
+    body.innerHTML=pageData.map(u=>{
+      const lic = (u.assignedLicenses||[]).map(l=>'<span class="tag">'+(l.name||l.skuId)+'</span>').join('') || '<span style="color:#9ca3af;">无</span>';
+      return '<tr>'+
+        '<td data-label="选择"><input type="checkbox" class="chk" data-g="'+u._globalId+'" value="'+u.id+'"></td>'+
+        '<td data-label="用户名"><strong>'+ (u.displayName||'') +'</strong></td>'+
+        '<td data-label="账号">'+u.userPrincipalName+'</td>'+
+        '<td data-label="订阅">'+lic+'</td>'+
+        '<td data-label="创建时间">'+new Date(u.createdDateTime).toLocaleString()+'</td>'+
+        '<td data-label="全局">'+u._globalLabel+'</td>'+
+        '<td data-label="UUID" style="font-size:11px;color:#9ca3af;">'+u.id+'</td>'+
+      '</tr>';
+    }).join('');
+  }
+  document.getElementById('pageInfo').innerText = '第 '+currentPage+' / '+totalPages+' 页 · 共 '+total+' 条';
+}
+
+async function fetchGlobals(){
+  const res = await fetch(adminPath + '/api/globals');
+  const data = await res.json();
+  globalsCache = data;
+  renderGlobalsFilter();
+}
+
+async function fetchUsers(){
+  document.getElementById('status').innerText='正在加载用户...';
+  const res = await fetch(adminPath + '/api/users');
+  const data = await res.json();
+  usersCache = data;
+  renderUserRows();
+  document.getElementById('status').innerText='加载完成';
+  setTimeout(()=>document.getElementById('status').innerText='', 2000);
+}
+
+document.getElementById('btnRefresh').onclick=fetchUsers;
+document.getElementById('btnPwd').onclick=()=>{ if(getSelected().length===0) return alert('请选择用户'); openModal('modalPwd'); };
+document.getElementById('btnLic').onclick=async()=>{
+  openModal('modalLic');
+  document.getElementById('licContent').innerText='查询中...';
+  const res = await fetch(adminPath + '/api/licenses');
+  const data = await res.json();
+  document.getElementById('licContent').innerHTML = data.map(i=>{
+    const remain=i.total-i.used;
+    const pct=i.total?Math.round(i.used/i.total*100):0;
+    const exp = i.expiresAt ? new Date(i.expiresAt).toLocaleString() : '-';
+    return '<div style="margin:8px 0;">'
+      + '<strong>'+i.globalLabel+' / '+i.skuPartNumber+'</strong>'
+      + '<div style="color:#6b7280;font-size:12px;margin-top:4px;line-height:1.6;">总量 '+i.total+'，已用 '+i.used+'，剩余 '+remain+'，使用率 '+pct+'%</div>'
+      + '<div style="color:#6b7280;font-size:12px;margin-top:2px;line-height:1.6;">订阅到期时间：'+exp+'</div>'
+      + '<div style="margin-top:6px;height:6px;background:#e5e7eb;border-radius:8px;overflow:hidden;">'
+      + '<div style="width:'+pct+'%;height:100%;background:var(--primary);"></div>'
+      + '</div>'
+      + '</div>';
+  }).join('') || '暂无数据';
+};
+document.getElementById('btnDel').onclick=async()=>{
+  const sel=getSelected(); if(!sel.length) return alert('请选择用户');
+  if(!confirm('确认删除选中的 '+sel.length+' 个用户？不可恢复')) return;
+  document.getElementById('status').innerText='删除中...';
+  for (const item of sel){
+    await fetch(adminPath + '/api/users/'+item.g+'/'+item.id,{method:'DELETE'});
+  }
+  fetchUsers();
 };
 
-async function getAccessToken(env) {
-    const params = new URLSearchParams();
-    params.append('client_id', env.AZURE_CLIENT_ID);
-    params.append('scope', 'https://graph.microsoft.com/.default');
-    params.append('client_secret', env.AZURE_CLIENT_SECRET);
-    params.append('grant_type', 'client_credentials');
-
-    const res = await fetch(`https://login.microsoftonline.com/${env.AZURE_TENANT_ID}/oauth2/v2.0/token`, {
-        method: 'POST',
-        body: params
-    });
-    const data = await res.json();
-    return data.access_token;
+function getSelected(){
+  return Array.from(document.querySelectorAll('.chk:checked')).map(c=>({id:c.value,g:c.getAttribute('data-g')}));
 }
+document.getElementById('chkAll').onchange=(e)=>{
+  document.querySelectorAll('.chk').forEach(c=>c.checked=e.target.checked);
+};
+
+document.querySelectorAll('input[name="pwdType"]').forEach(r=>{
+  r.onchange=()=>{ document.getElementById('customPwd').style.display = r.value==='custom' ? 'block' : 'none'; };
+});
+document.getElementById('confirmPwd').onclick=async()=>{
+  const sel=getSelected(); if(!sel.length) return alert('请选择用户');
+  const type=document.querySelector('input[name="pwdType"]:checked').value;
+  let pwd='';
+  if(type==='custom'){ pwd=document.getElementById('customPwd').value; if(!pwd) return alert('请输入密码'); }
+  const result=[];
+  for(const s of sel){
+    const finalPwd = type==='auto' ? generatePass() : pwd;
+    await fetch(adminPath + '/api/users/'+s.g+'/'+s.id+'/password',{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:finalPwd})});
+    result.push(s.id+' => '+finalPwd);
+  }
+  document.getElementById('pwdResult').innerText='完成：\\n'+result.join('\\n');
+};
+function generatePass(){
+  const chars="abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*";
+  let p=""; for(let i=0;i<12;i++) p+=chars[Math.floor(Math.random()*chars.length)];
+  return p+"Aa1!";
+}
+
+// sorting
+document.querySelectorAll('#userTable th[data-sort]').forEach(th=>{
+  th.onclick=()=>{
+    const key=th.getAttribute('data-sort');
+    if(sortKey===key) sortDir*=-1; else {sortKey=key; sortDir=1;}
+    renderUserRows();
+  };
+});
+updateArrows();
+
+// pagination controls
+document.getElementById('pageSize').onchange=(e)=>{ pageSize=parseInt(e.target.value)||20; currentPage=1; renderUserRows(); };
+document.getElementById('prevPage').onclick=()=>{ if(currentPage>1){ currentPage--; renderUserRows(); } };
+document.getElementById('nextPage').onclick=()=>{
+  const data=applyFilterSort(usersCache);
+  const totalPages=Math.max(1,Math.ceil(data.length/pageSize));
+  if(currentPage<totalPages){ currentPage++; renderUserRows(); }
+};
+document.getElementById('goPage').onclick=()=>{ const val=parseInt(document.getElementById('jumpPage').value)||1; const data=applyFilterSort(usersCache); const totalPages=Math.max(1,Math.ceil(data.length/pageSize)); currentPage=Math.min(Math.max(1,val),totalPages); renderUserRows(); };
+
+// search
+document.getElementById('btnSearch').onclick=()=>{
+  searchField=document.getElementById('searchField').value;
+  searchText=document.getElementById('searchText').value.trim();
+  currentPage=1;
+  renderUserRows();
+};
+document.getElementById('btnClear').onclick=()=>{
+  document.getElementById('searchText').value='';
+  searchText='';
+  currentPage=1;
+  renderUserRows();
+};
+
+(async()=>{ await fetchGlobals(); await fetchUsers(); })();
+</script>
+    `,
+  });
+}
+
+function renderGlobalsPage(adminPath) {
+  return adminLayout({
+    title: '全局账户',
+    adminPath,
+    active: 'globals',
+    content: `
+<div class="section">
+  <div class="toolbar">
+    <button id="btnAdd">➕ 新增全局</button>
+    <div class="search-box">
+      <span class="label" style="margin:0;">搜索：</span>
+      <input id="gSearch" class="input-compact" placeholder="名称/域/租户">
+      <button id="gSearchBtn" class="btn-ghost">搜索</button>
+      <button id="gClearBtn" class="btn-ghost">清空</button>
+    </div>
+  </div>
+  <div class="table-wrap">
+    <table class="table" id="gTable">
+      <thead><tr>
+        <th data-sort="label">名称 <span class="arrow" id="garr-label">↕</span></th>
+        <th data-sort="defaultDomain">域 <span class="arrow" id="garr-defaultDomain">↕</span></th>
+        <th data-sort="tenantId">租户 <span class="arrow" id="garr-tenantId">↕</span></th>
+        <th data-sort="skuCount">SKU 数 <span class="arrow" id="garr-skuCount">↕</span></th>
+        <th>操作</th>
+      </tr></thead>
+      <tbody id="gBody"></tbody>
+    </table>
+  </div>
+</div>
+
+<div class="modal" id="modalG">
+  <div class="dialog" style="max-width:720px;">
+    <div class="header"><h3 id="gTitle" style="margin:0;">新增全局</h3><button class="modal-close" onclick="closeModal('modalG')" aria-label="Close">✕</button></div>
+    <div class="row"><span class="label">展示名称（用户可见）</span><input id="gLabel"></div>
+    <div class="row"><span class="label">默认邮箱后缀 (不含 @)</span><input id="gDomain"></div>
+    <div class="row"><span class="label">租户 ID</span><input id="gTenant"></div>
+    <div class="row"><span class="label">客户端 ID</span><input id="gClientId"></div>
+    <div class="row"><span class="label">客户端密钥</span><input id="gSecret"></div>
+    <div class="row"><span class="label">SKU JSON (键为展示名, 值为 SKU ID)</span><textarea id="gSku" rows="4" placeholder='例如 {"E5开发版":"xxx","A1教育":"yyy"}'></textarea>
+    <div class="toolbar" style="margin-top:6px;">
+      <button id="btnFetchSku" class="btn-ghost" disabled>点我获取SKU</button>
+      <span style="color:#6b7280;font-size:12px;line-height:1.4;">填入租户ID/客户端ID/客户端密钥后即可获取</span>
+    </div>
+    <div class="footer">
+      <button class="btn-ghost" onclick="closeModal('modalG')">取消</button>
+      <button id="btnSaveG">保存</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const adminPath='${adminPath}';
+let editingId=null;
+let gSortKey='label', gSortDir=1;
+let gSearchText='';
+let globalsData=[];
+
+function closeModal(id){ document.getElementById(id).style.display='none'; }
+function openModal(id){ document.getElementById(id).style.display='flex'; }
+
+function updateGArrows(){
+  ['label','defaultDomain','tenantId','skuCount'].forEach(k=>{
+    const th=document.querySelector('#gTable th[data-sort="'+k+'"]');
+    const arr=document.getElementById('garr-'+k);
+    if(th){ th.classList.remove('active'); if(arr) arr.innerText='↕'; }
+    if(k===gSortKey){ if(th) th.classList.add('active'); if(arr) arr.innerText=gSortDir===1?'↑':'↓'; }
+  });
+}
+
+function renderGlobals(){
+  updateGArrows();
+  let list=[...globalsData];
+  if(gSearchText){
+    const t=gSearchText.toLowerCase();
+    list=list.filter(x=>(x.label||'').toLowerCase().includes(t)||(x.defaultDomain||'').toLowerCase().includes(t)||(x.tenantId||'').toLowerCase().includes(t));
+  }
+  list.sort((a,b)=>{
+    const va=a[gSortKey]||''; const vb=b[gSortKey]||'';
+    if(typeof va==='string') return gSortDir*va.localeCompare(vb);
+    return gSortDir*((va>vb)-(va<vb));
+  });
+  const body=document.getElementById('gBody');
+  body.innerHTML=list.map(g=>{
+    return '<tr>'+
+      '<td data-label="名称"><strong>'+g.label+'</strong></td>'+
+      '<td data-label="域">'+g.defaultDomain+'</td>'+
+      '<td data-label="租户ID">'+g.tenantId+'</td>'+
+      '<td data-label="SKU数">'+g.skuCount+'</td>'+
+      '<td data-label="操作"><button class="btn" onclick="editG(\\\''+g.id+'\\\')">编辑</button> <button class="btn-danger" onclick="delG(\\\''+g.id+'\\\')">删除</button></td>'+
+    '</tr>';
+  }).join('') || '<tr><td colspan="5" style="text-align:center;">暂无全局</td></tr>';
+}
+
+async function loadGlobals(){
+  const res = await fetch(adminPath+'/api/globals');
+  const data = await res.json();
+  globalsData = data.map(g=>({...g, skuCount:Object.keys(g.skuMap||{}).length}));
+  renderGlobals();
+}
+
+document.getElementById('btnAdd').onclick=()=>{editingId=null; document.getElementById('gTitle').innerText='新增全局'; openModal('modalG');};
+
+window.editG=async(id)=>{
+  const res=await fetch(adminPath+'/api/globals/'+id);
+  const g=await res.json();
+  editingId=id;
+  document.getElementById('gTitle').innerText='编辑全局';
+  document.getElementById('gLabel').value=g.label||'';
+  document.getElementById('gDomain').value=g.defaultDomain||'';
+  document.getElementById('gTenant').value=g.tenantId||'';
+  document.getElementById('gClientId').value=g.clientId||'';
+  document.getElementById('gSecret').value=g.clientSecret||'';
+  document.getElementById('gSku').value=JSON.stringify(g.skuMap||{}, null, 2);
+  openModal('modalG');
+};
+
+window.delG=async(id)=>{
+  if(!confirm('删除该全局？')) return;
+  await fetch(adminPath+'/api/globals/'+id,{method:'DELETE'});
+  loadGlobals();
+};
+
+document.getElementById('btnSaveG').onclick=async()=>{
+  const payload={
+    label:document.getElementById('gLabel').value.trim(),
+    defaultDomain:document.getElementById('gDomain').value.trim(),
+    tenantId:document.getElementById('gTenant').value.trim(),
+    clientId:document.getElementById('gClientId').value.trim(),
+    clientSecret:document.getElementById('gSecret').value.trim(),
+    skuMap:document.getElementById('gSku').value
+  };
+  const method = editingId ? 'PATCH' : 'POST';
+  const url = adminPath+'/api/globals'+(editingId?'/'+editingId:'');
+  const res = await fetch(url,{method,headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+  const d = await res.json();
+  if(d.success){ closeModal('modalG'); loadGlobals(); }
+  else alert(d.message||'保存失败');
+};
+
+function canFetchSku(){
+  const t=(document.getElementById('gTenant').value||'').trim();
+  const c=(document.getElementById('gClientId').value||'').trim();
+  const s=(document.getElementById('gSecret').value||'').trim();
+  return !!(t && c && s);
+}
+function refreshFetchBtn(){
+  const btn=document.getElementById('btnFetchSku');
+  btn.disabled = !canFetchSku();
+}
+['gTenant','gClientId','gSecret'].forEach(id=>{
+  const el=document.getElementById(id);
+  if(el) el.addEventListener('input', refreshFetchBtn);
+});
+refreshFetchBtn();
+
+document.getElementById('btnFetchSku').onclick=async()=>{
+  if(!canFetchSku()){ alert('请先填写租户ID、客户端ID、客户端密钥'); return; }
+  const payload={
+    tenantId:(document.getElementById('gTenant').value||'').trim(),
+    clientId:(document.getElementById('gClientId').value||'').trim(),
+    clientSecret:(document.getElementById('gSecret').value||'').trim()
+  };
+  const res=await fetch(adminPath+'/api/fetch_skus',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+  const data=await res.json();
+  if(data.success){ document.getElementById('gSku').value=JSON.stringify(data.map||{},null,2); }
+  else alert(data.message||'获取失败');
+};
+
+document.querySelectorAll('#gTable th[data-sort]').forEach(th=>{
+  th.onclick=()=>{
+    const k=th.getAttribute('data-sort');
+    if(gSortKey===k) gSortDir*=-1; else {gSortKey=k; gSortDir=1;}
+    renderGlobals();
+  };
+});
+document.getElementById('gSearchBtn').onclick=()=>{ gSearchText=document.getElementById('gSearch').value.trim(); renderGlobals(); };
+document.getElementById('gClearBtn').onclick=()=>{ document.getElementById('gSearch').value=''; gSearchText=''; renderGlobals(); };
+
+loadGlobals();
+</script>
+    `,
+  });
+}
+
+function renderInvitesPage(adminPath, globals) {
+  return adminLayout({
+    title: '邀请码管理',
+    adminPath,
+    active: 'invites',
+    content: `
+<div class="section">
+  <div class="toolbar">
+    <button id="btnGen">🎲 生成邀请码</button>
+    <button id="btnDelInvites" class="btn-danger">🗑️ 删除所选</button>
+    <button id="btnExport">⬇️ 导出所选</button>
+    <button id="btnRefreshInvites">🔄 刷新</button>
+  </div>
+  <div class="toolbar search-box">
+    <span class="label" style="margin:0;">筛选/搜索：</span>
+    <select id="iSearchField" class="input-compact">
+      <option value="code">邀请码</option>
+      <option value="status">状态</option>
+      <option value="scope">限制范围</option>
+    </select>
+    <input id="iSearchText" class="input-compact" placeholder="输入关键词，支持模糊">
+    <button id="iSearchBtn" class="btn-ghost">搜索</button>
+    <button id="iClearBtn" class="btn-ghost">清空</button>
+  </div>
+  <div class="toolbar" style="gap:6px;">
+    <span class="label" style="margin:0;">排序:</span>
+    <select id="sortKey" style="max-width:180px;">
+      <option value="code" selected>邀请码首字母</option>
+      <option value="createdAt">生成时间</option>
+      <option value="usedAt">使用时间</option>
+      <option value="status">使用状态</option>
+      <option value="scope">限制范围</option>
+    </select>
+  </div>
+  <div class="pagination" style="margin:4px 0%;">
+    <span class="label" style="margin:0;">分页:</span>
+    <select id="pageSizeInvite">
+      <option value="20" selected>20/页</option>
+      <option value="30">30/页</option>
+      <option value="50">50/页</option>
+      <option value="100">100/页</option>
+    </select>
+    <span id="pageInfoInvite"></span>
+    <button id="prevInvite">上一页</button>
+    <button id="nextInvite">下一页</button>
+    <input class="page-input" id="jumpInvite" type="number" min="1" placeholder="页码">
+    <button id="goInvite">跳转</button>
+  </div>
+  <div class="table-wrap">
+    <table class="table">
+      <thead><tr>
+        <th><input type="checkbox" id="chkInviteAll"></th>
+        <th data-sort="code">邀请码 <span class="arrow" id="iarr-code">↕</span></th>
+        <th data-sort="limit">限制次数 <span class="arrow" id="iarr-limit">↕</span></th>
+        <th data-sort="used">已用 <span class="arrow" id="iarr-used">↕</span></th>
+        <th data-sort="status">状态 <span class="arrow" id="iarr-status">↕</span></th>
+        <th data-sort="scope">限制范围 <span class="arrow" id="iarr-scope">↕</span></th>
+        <th data-sort="createdAt">生成时间 <span class="arrow" id="iarr-createdAt">↕</span></th>
+        <th data-sort="usedAt">最近使用 <span class="arrow" id="iarr-usedAt">↕</span></th>
+      </tr></thead>
+      <tbody id="inviteBody"></tbody>
+    </table>
+  </div>
+</div>
+
+<div class="modal" id="modalGen">
+  <div class="dialog" style="max-width:620px;">
+    <div class="header"><h3 style="margin:0;">生成邀请码</h3><button class="modal-close" onclick="closeModal('modalGen')" aria-label="Close">✕</button></div>
+    <div class="row"><span class="label">选择字符集 (至少选一项)</span>
+      <label class="inline"><input type="checkbox" id="cUpper" checked> 大写</label>
+      <label class="inline"><input type="checkbox" id="cLower" checked> 小写</label>
+      <label class="inline"><input type="checkbox" id="cDigit" checked> 数字</label>
+      <label class="inline"><input type="checkbox" id="cSym" checked> 特殊符号</label>
+    </div>
+    <div class="row"><span class="label">邀请码长度</span><input id="cLen" type="number" value="16" min="4"></div>
+    <div class="row"><span class="label">生成数量</span><input id="cQty" type="number" value="10" min="1"></div>
+    <div class="row"><span class="label">每个邀请码可使用次数</span><input id="cLimit" type="number" value="1" min="1"></div>
+    <div class="row">
+      <span class="label">限制可注册的全局+订阅 (至少选一项)</span>
+      <div id="scopeWrap" style="max-height:200px;overflow:auto;border:1px solid #e5e7eb;border-radius:12px;padding:10px;background:#fafafa;"></div>
+    </div>
+    <div class="footer">
+      <button class="btn-ghost" onclick="closeModal('modalGen')">取消生成</button>
+      <button id="doGen">确定生成</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const adminPath='${adminPath}';
+const globalsList = ${JSON.stringify(globals)};
+function closeModal(id){ document.getElementById(id).style.display='none'; }
+function openModal(id){ document.getElementById(id).style.display='flex'; }
+
+let invitesCache=[];
+let sortKey='code';
+let sortDir=1; // default asc
+let invitePage=1;
+let invitePageSize=20;
+let iSearchField='code';
+let iSearchText='';
+
+function updateIArrows(){
+  ['code','limit','used','status','scope','createdAt','usedAt'].forEach(k=>{
+    const th=document.querySelector('th[data-sort="'+k+'"]');
+    const arr=document.getElementById('iarr-'+k);
+    if(th){ th.classList.remove('active'); if(arr) arr.innerText='↕'; }
+    if(k===sortKey){ if(th) th.classList.add('active'); if(arr) arr.innerText=sortDir===1?'↑':'↓'; }
+  });
+}
+
+function buildScopeOptions(){
+  const wrap=document.getElementById('scopeWrap');
+  wrap.innerHTML = globalsList.map(g=>{
+    const sku = Object.keys(g.skuMap||{});
+    if(!sku.length) return '';
+    return '<div style="margin-bottom:8px;"><strong>'+g.label+'</strong><br>'+sku.map(s=>{
+      return '<label class="inline" style="margin-left:8px;"><input type="checkbox" class="scopeChk" data-g="'+g.id+'" data-sku="'+s+'"> '+g.label+' / '+s+'</label>';
+    }).join('')+'</div>';
+  }).join('') || '<div style="color:#9ca3af;">暂无全局/订阅</div>';
+}
+
+document.getElementById('btnGen').onclick=()=>{buildScopeOptions(); openModal('modalGen');};
+document.getElementById('btnRefreshInvites').onclick=loadInvites;
+document.getElementById('chkInviteAll').onchange=(e)=>{ document.querySelectorAll('.inviteChk').forEach(c=>c.checked=e.target.checked); };
+
+document.getElementById('doGen').onclick=async()=>{
+  const chars=[];
+  if(document.getElementById('cUpper').checked) chars.push('upper');
+  if(document.getElementById('cLower').checked) chars.push('lower');
+  if(document.getElementById('cDigit').checked) chars.push('digit');
+  if(document.getElementById('cSym').checked) chars.push('sym');
+  if(!chars.length) return alert('至少选择一个字符集');
+  const scopes = Array.from(document.querySelectorAll('.scopeChk:checked')).map(c=>({globalId:c.getAttribute('data-g'), skuName:c.getAttribute('data-sku')}));
+  if(!scopes.length) return alert('至少选择一个可用范围');
+  const payload={
+    sets:chars,
+    length:parseInt(document.getElementById('cLen').value)||16,
+    quantity:parseInt(document.getElementById('cQty').value)||1,
+    limit:parseInt(document.getElementById('cLimit').value)||1,
+    scopes
+  };
+  const res=await fetch(adminPath+'/api/invites/generate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+  const data=await res.json();
+  if(data.success){ alert('生成完成，新增 '+data.count+' 条'); closeModal('modalGen'); loadInvites(); }
+  else alert(data.message||'生成失败');
+};
+
+document.getElementById('btnDelInvites').onclick=async()=>{
+  const sel = Array.from(document.querySelectorAll('.inviteChk:checked')).map(c=>c.value);
+  if(!sel.length) return alert('请选择邀请码');
+  if(!confirm('确认删除选中邀请码？')) return;
+  await fetch(adminPath+'/api/invites/bulk',{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({codes:sel})});
+  loadInvites();
+};
+
+document.getElementById('btnExport').onclick=()=>{
+  const sel = Array.from(document.querySelectorAll('.inviteChk:checked')).map(c=>c.value);
+  if(!sel.length) return alert('请选择邀请码');
+  const blob = new Blob([sel.join('\\n')], {type:'text/plain'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a'); a.href=url; a.download='invites.txt'; a.click();
+  URL.revokeObjectURL(url);
+};
+
+document.getElementById('sortKey').onchange=()=>{ sortKey=document.getElementById('sortKey').value; renderInvites(); };
+document.querySelectorAll('th[data-sort]').forEach(th=>{
+  th.onclick=()=>{ const k=th.getAttribute('data-sort'); if(k===sortKey) sortDir*=-1; else {sortKey=k; sortDir=1;} renderInvites(); };
+});
+
+document.getElementById('pageSizeInvite').onchange=(e)=>{ invitePageSize=parseInt(e.target.value)||20; invitePage=1; renderInvites(); };
+document.getElementById('prevInvite').onclick=()=>{ if(invitePage>1){ invitePage--; renderInvites(); } };
+document.getElementById('nextInvite').onclick=()=>{ const total=Math.max(1,Math.ceil(invitesCache.length/invitePageSize)); if(invitePage<total){ invitePage++; renderInvites(); } };
+document.getElementById('goInvite').onclick=()=>{ const val=parseInt(document.getElementById('jumpInvite').value)||1; const total=Math.max(1,Math.ceil(invitesCache.length/invitePageSize)); invitePage=Math.min(Math.max(1,val), total); renderInvites(); };
+
+document.getElementById('iSearchBtn').onclick=()=>{ iSearchField=document.getElementById('iSearchField').value; iSearchText=document.getElementById('iSearchText').value.trim(); invitePage=1; renderInvites(); };
+document.getElementById('iClearBtn').onclick=()=>{ document.getElementById('iSearchText').value=''; iSearchText=''; invitePage=1; renderInvites(); };
+
+function renderInvites(){
+  updateIArrows();
+  let list=[...invitesCache];
+  if(iSearchText){
+    const t=iSearchText.toLowerCase();
+    list=list.filter(c=>{
+      if(iSearchField==='code') return (c.code||'').toLowerCase().includes(t);
+      if(iSearchField==='status'){
+        const st = c.used>=c.limit ? '已用完' : '可用';
+        return st.toLowerCase().includes(t);
+      }
+      if(iSearchField==='scope'){
+        const scopeText = (c.allowed||[]).map(s=>{
+          const g=globalsList.find(x=>x.id===s.globalId);
+          return (g?g.label:'')+' '+s.skuName;
+        }).join(' ');
+        return scopeText.toLowerCase().includes(t);
+      }
+      return true;
+    });
+  }
+  list.sort((a,b)=>{
+    if(sortKey==='status'){
+      return sortDir * (((a.used>=a.limit)?1:0) - ((b.used>=b.limit)?1:0));
+    }
+    if(sortKey==='scope'){
+      const sa=(a.allowed||[]).map(s=>s.globalId+s.skuName).join(','); 
+      const sb=(b.allowed||[]).map(s=>s.globalId+s.skuName).join(',');
+      return sortDir * sa.localeCompare(sb);
+    }
+    const va=a[sortKey]||0, vb=b[sortKey]||0;
+    if(typeof va==='string') return sortDir*va.localeCompare(vb);
+    return sortDir*((va>vb)-(va<vb));
+  });
+  const total=list.length;
+  const totalPages=Math.max(1,Math.ceil(total/invitePageSize));
+  invitePage=Math.min(invitePage,totalPages);
+  const start=(invitePage-1)*invitePageSize;
+  const pageData=list.slice(start,start+invitePageSize);
+  const body=document.getElementById('inviteBody');
+  body.innerHTML = pageData.map(c=>{
+    const status = c.used >= c.limit ? '<span class="tag" style="background:#fee2e2;color:#991b1b;">已用完</span>' : '<span class="tag" style="background:#dcfce7;color:#166534;">可用</span>';
+    const scope = (c.allowed||[]).map(s=>{
+      const g = globalsList.find(x=>x.id===s.globalId);
+      return '<span class="tag">'+(g?g.label:'?')+' / '+s.skuName+'</span>';
+    }).join('') || '<span style="color:#9ca3af;">未设置</span>';
+    return '<tr>'+
+      '<td data-label="选择"><input type="checkbox" class="inviteChk" value="'+c.code+'"></td>'+
+      '<td data-label="邀请码"><code>'+c.code+'</code></td>'+
+      '<td data-label="限制次数">'+c.limit+'</td>'+
+      '<td data-label="已用">'+c.used+'</td>'+
+      '<td data-label="状态">'+status+'</td>'+
+      '<td data-label="限制范围">'+scope+'</td>'+
+      '<td data-label="生成时间">'+new Date(c.createdAt).toLocaleString()+'</td>'+
+      '<td data-label="最近使用">'+ (c.usedAt?new Date(c.usedAt).toLocaleString():'-') +'</td>'+
+    '</tr>';
+  }).join('') || '<tr><td colspan="8" style="text-align:center;">暂无邀请码</td></tr>';
+  document.getElementById('pageInfoInvite').innerText='第 '+invitePage+' / '+totalPages+' 页 · 共 '+total+' 条';
+}
+
+async function loadInvites(){
+  const res = await fetch(adminPath+'/api/invites?sort='+sortKey);
+  const data = await res.json();
+  invitesCache = data;
+  renderInvites();
+}
+
+loadInvites();
+</script>
+    `,
+  });
+}
+
+function renderSettingsPage(adminPath, cfg) {
+  const protectedPrefixes = (cfg.protectedPrefixes || []).join(',');
+  return adminLayout({
+    title: '设置',
+    adminPath,
+    active: 'settings',
+    content: `
+<div class="section">
+  <h3 style="margin-top:0;">后台账号</h3>
+  <div class="row"><span class="label">后台用户名</span><input id="sAdminUser" value="${cfg.adminUsername || 'admin'}" placeholder="例如：admin"></div>
+  <div class="row"><span class="label">后台新密码</span><input id="sAdminPwd" type="password" placeholder="留空不修改（至少 8 位）"></div>
+  <div style="color:#6b7280;font-size:12px;line-height:1.6;margin-top:6px;">
+    说明：修改用户名/密码后，当前会话不受影响，下次登录按新账号登录。
+  </div>
+</div>
+
+<div class="section">
+  <h3 style="margin-top:0;">基础设置</h3>
+  <div class="row"><span class="label">后台路径</span><input id="sPath" value="${cfg.adminPath}" placeholder="/admin"></div>
+  <div class="row"><span class="label">Turnstile Site Key (留空关闭)</span><input id="sSite" value="${cfg.turnstile.siteKey||''}"></div>
+  <div class="row"><span class="label">Turnstile Secret Key (留空关闭)</span><input id="sSecret" value="${cfg.turnstile.secretKey||''}"></div>
+  <div class="row"><label class="inline"><input type="checkbox" id="sInvite" ${cfg.invite?.enabled?'checked':''}> 启用邀请码注册</label></div>
+</div>
+
+<div class="section">
+  <h3 style="margin-top:0;">额外保护账户（禁止注册）</h3>
+  <div class="row">
+    <span class="label">额外保护账户（英文逗号,分隔）</span>
+    <textarea id="sProtectPrefixes" rows="3" placeholder="例如：admin,superadmin,root">${protectedPrefixes}</textarea>
+  </div>
+  <div style="color:#6b7280;font-size:12px;line-height:1.6;">
+    说明：<br/>
+    1) 此处仅匹配邮箱的 <strong>@ 前缀（local-part）</strong>，例如 <code>admin@abc.onmicrosoft.com</code> 只需配置 <code>admin</code>。<br/>
+    2) 命中的用户名将 <strong>禁止在前台注册</strong>，并且若账号已存在，将 <strong>禁止通过面板或 API 删除</strong>（防误删/防篡改）。<br/>
+    3) 默认已内置常见敏感用户名（如 admin/root 等），建议不要清空。
+  </div>
+
+  <div class="toolbar" style="margin-top:14px;">
+    <button id="btnSaveSetting">💾 保存</button>
+  </div>
+</div>
+
+<script>
+const adminPath='${adminPath}';
+function parseCommaList(v){
+  return (v||'')
+    .split(',')
+    .map(s=>s.trim())
+    .filter(Boolean);
+}
+document.getElementById('btnSaveSetting').onclick=async()=>{
+  const adminUsername = (document.getElementById('sAdminUser').value || '').trim();
+  const adminPassword = document.getElementById('sAdminPwd').value || '';
+  const payload={
+    adminPath: (document.getElementById('sPath').value || '/admin').trim(),
+    adminUsername,
+    adminPassword: adminPassword ? adminPassword : undefined,
+    turnstile: { siteKey: (document.getElementById('sSite').value||'').trim(), secretKey: (document.getElementById('sSecret').value||'').trim() },
+    protectedPrefixes: parseCommaList(document.getElementById('sProtectPrefixes').value),
+    inviteEnabled: document.getElementById('sInvite').checked
+  };
+  const res=await fetch(adminPath+'/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+  const data=await res.json();
+  if(data.success){
+    alert('保存成功');
+    if(data.newPath && data.newPath !== adminPath){ location.href = data.newPath + '/settings'; }
+  } else alert(data.message||'保存失败');
+};
+</script>
+    `,
+  });
+}
+
+/* -------------------- Core Logic -------------------- */
+async function getAccessTokenForGlobal(global, fetcher) {
+  const params = new URLSearchParams();
+  params.append('client_id', global.clientId);
+  params.append('scope', 'https://graph.microsoft.com/.default');
+  params.append('client_secret', global.clientSecret);
+  params.append('grant_type', 'client_credentials');
+  const res = await fetcher(`https://login.microsoftonline.com/${global.tenantId}/oauth2/v2.0/token`, {
+    method: 'POST',
+    body: params,
+  });
+  const data = await res.json();
+  if (!data.access_token) throw new Error('获取令牌失败');
+  return data.access_token;
+}
+
+async function fetchSubscribedSkus(global, fetcher) {
+  const token = await getAccessTokenForGlobal(global, fetcher);
+  const resp = await fetcher('https://graph.microsoft.com/v1.0/subscribedSkus', {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!resp.ok) {
+    const err = await resp.json().catch(() => ({}));
+    throw new Error(err?.error?.message || '获取订阅 SKU 失败');
+  }
+  const data = await resp.json();
+  return Array.isArray(data.value) ? data.value : [];
+}
+
+function remainingFromSubscribedSku(sku) {
+  const enabled = Number(sku?.prepaidUnits?.enabled ?? 0);
+  const consumed = Number(sku?.consumedUnits ?? 0);
+  const remaining = enabled - consumed;
+  return Number.isFinite(remaining) ? Math.max(0, remaining) : 0;
+}
+function getEnvHiddenList(env) {
+  if (!env.HIDDEN_USER) return [];
+  return env.HIDDEN_USER.split(/[;,]/).map(s => s.trim()).filter(Boolean);
+}
+
+function normalizeLower(v) {
+  return (v || '').toString().trim().toLowerCase();
+}
+
+function getLocalPartFromUpn(upn) {
+  const v = normalizeLower(upn);
+  const at = v.indexOf('@');
+  return at >= 0 ? v.slice(0, at) : v;
+}
+
+function buildProtectionSets(env, cfg) {
+  const emailSet = new Set();
+  (cfg.protectedUsers || []).forEach(u => {
+    const x = normalizeLower(u);
+    if (x) emailSet.add(x);
+  });
+  getEnvHiddenList(env).forEach(u => {
+    const x = normalizeLower(u);
+    if (x) emailSet.add(x);
+  });
+
+  const prefixSet = new Set();
+  (cfg.protectedPrefixes || []).forEach(p => {
+    const x = normalizeLower(p);
+    if (x) prefixSet.add(x);
+  });
+
+  return { emailSet, prefixSet };
+}
+
+function isProtectedUpn(upn, env, cfg) {
+  const { emailSet, prefixSet } = buildProtectionSets(env, cfg);
+  const v = normalizeLower(upn);
+  if (!v) return false;
+  if (emailSet.has(v)) return true;
+  const local = getLocalPartFromUpn(v);
+  if (prefixSet.has(local)) return true;
+  return false;
+}
+function filterProtectedUsers(list, env, cfg) {
+  const { emailSet, prefixSet } = buildProtectionSets(env, cfg);
+  return list.filter(u => {
+    const upn = normalizeLower(u.userPrincipalName || '');
+    if (emailSet.has(upn)) return false;
+    const local = getLocalPartFromUpn(upn);
+    if (prefixSet.has(local)) return false;
+    return true;
+  });
+}
+
+async function handleRegister(env, req, cfg) {
+  const form = await req.formData();
+  const username = (form.get('username')||'').trim();
+  const password = form.get('password')||'';
+  const skuName = form.get('skuName');
+  const globalId = form.get('globalId');
+  const inviteCode = form.get('inviteCode');
+  const turnstileToken = form.get('cf-turnstile-response');
+  const clientIp = req.headers.get('CF-Connecting-IP');
+
+  const global = (cfg.globals||[]).find(g=>g.id===globalId);
+  if(!global) return jsonResponse({success:false,message:'请选择有效全局'},400);
+  const skuMap = global.skuMap||{};
+  const skuId = skuMap[skuName];
+  if(!skuId) return jsonResponse({success:false,message:'请选择有效订阅'},400);
+  if(!/^[a-zA-Z0-9]+$/.test(username)) return jsonResponse({success:false,message:'用户名格式错误'},400);
+
+  // invitation check
+  if(cfg.invite?.enabled){
+    const invites = await getInvites(env);
+    const idx = invites.findIndex(c=>c.code===inviteCode);
+    if(idx===-1) return jsonResponse({success:false,message:'邀请码无效'},400);
+    const c = invites[idx];
+    if(c.used >= c.limit) return jsonResponse({success:false,message:'邀请码已用完'},400);
+    const allowed = c.allowed||[];
+    const matched = allowed.some(a=>a.globalId===globalId && a.skuName===skuName);
+    if(!matched) return jsonResponse({success:false,message:'邀请码不允许当前全局/订阅'},400);
+    c.used += 1; c.usedAt = Date.now();
+    invites[idx]=c; await saveInvites(env,invites);
+  }
+
+  // turnstile verify
+  if(cfg.turnstile?.secretKey && turnstileToken){
+    const ver = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({secret:cfg.turnstile.secretKey,response:turnstileToken,remoteip:clientIp})
+    });
+    const verData = await ver.json();
+    if(!verData.success) return jsonResponse({success:false,message:'人机验证失败'},400);
+  }
+
+  const userEmail = `${username}@${global.defaultDomain}`;
+  if(isProtectedUpn(userEmail, env, cfg)) {
+    return jsonResponse({success:false,message:'该用户名被禁止注册！请勿尝试注册非法用户名！'},403);
+  }
+
+  if(password.toLowerCase().includes(username.toLowerCase())) return jsonResponse({success:false,message:'密码不能包含用户名'},400);
+  if(!checkPasswordComplexity(password)) return jsonResponse({success:false,message:'密码不符合复杂度'},400);
+
+  const token = await getAccessTokenForGlobal(global, fetch);
+  // create user
+  const createResp = await fetch('https://graph.microsoft.com/v1.0/users',{
+    method:'POST',
+    headers:{'Authorization':`Bearer ${token}`,'Content-Type':'application/json'},
+    body:JSON.stringify({
+      accountEnabled:true,
+      displayName:username,
+      mailNickname:username,
+      userPrincipalName:userEmail,
+      passwordProfile:{forceChangePasswordNextSignIn:false,password},
+      usageLocation:"CN"
+    })
+  });
+  if(!createResp.ok){
+    const err = await createResp.json().catch(()=>({}));
+    return jsonResponse({success:false,message:err.error?.message||'创建失败'},400);
+  }
+  const newUser = await createResp.json();
+
+  // assign license
+  const licResp = await fetch(`https://graph.microsoft.com/v1.0/users/${newUser.id}/assignLicense`,{
+    method:'POST',
+    headers:{'Authorization':`Bearer ${token}`,'Content-Type':'application/json'},
+    body:JSON.stringify({addLicenses:[{disabledPlans:[],skuId}],removeLicenses:[]})
+  });
+  if(!licResp.ok){
+    const err = await licResp.json().catch(()=>({}));
+    return jsonResponse({success:false,message:'账号已创建但订阅分配失败: '+(err.error?.message||'未知')},400);
+  }
+  return jsonResponse({success:true,email:userEmail});
+}
+
+/* -------------------- Request Handler -------------------- */
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    let cfg = await getConfig(env);
+    const adminPath = cfg.adminPath || '/admin';
+    const installed = !!(await env.CONFIG_KV.get(KV.INSTALL_LOCK));
+    const isSetupPath = url.pathname === `${adminPath}/setup`;
+    const isLoginPath = url.pathname === `${adminPath}/login`;
+
+    // redirect to setup if not installed
+    if(!installed && !isSetupPath) return redirect(`${adminPath}/setup`);
+
+    /* ---------- Setup ---------- */
+    if(isSetupPath){
+      if(request.method==='GET') return htmlResponse(renderSetup(adminPath));
+      if(request.method==='POST'){
+        const body = await request.json().catch(()=>({}));
+        const username = (body.username || '').toString().trim();
+        const password = (body.password || '').toString();
+
+        if(!/^[a-zA-Z0-9_\-]{3,32}$/.test(username)){
+          return jsonResponse({success:false,message:'用户名格式不正确（3-32位，仅字母/数字/_/-）'},400);
+        }
+        if(!password || password.length<8){
+          return jsonResponse({success:false,message:'密码至少 8 位'},400);
+        }
+
+        const newPath = (body.adminPath || '/admin').toString().trim() || '/admin';
+        const hash = await sha256(password);
+
+        cfg = mergeConfig({ ...cfg, adminUsername: username, adminPasswordHash: hash, adminPath: newPath });
+        await setConfig(env, cfg);
+        await env.CONFIG_KV.put(KV.INSTALL_LOCK,'1');
+        return jsonResponse({success:true});
+      }
+    }
+
+    /* ---------- Login ---------- */
+    if(isLoginPath){
+      if(request.method==='GET') return htmlResponse(renderLogin(adminPath));
+      if(request.method==='POST'){
+        const body = await request.json().catch(()=>({}));
+        const username = (body.username || '').toString().trim();
+        const pwdHash = await sha256((body.password||'').toString());
+
+        const cfgUser = (cfg.adminUsername || 'admin').toString().trim();
+        if(username.toLowerCase() !== cfgUser.toLowerCase() || pwdHash !== cfg.adminPasswordHash){
+          return jsonResponse({success:false,message:'用户名或密码错误'},401);
+        }
+
+        const token = await createSession(env);
+        return new Response(JSON.stringify({success:true}),{
+          headers:{
+            'Content-Type':'application/json',
+            'Set-Cookie':`ADMIN_SESSION=${token}; Path=/; HttpOnly; Secure; SameSite=Lax`
+          }
+        });
+      }
+    }
+
+    /* ---------- Admin HTML Pages ---------- */
+    if(url.pathname === `${adminPath}/users`){
+      if(!(await verifySession(env, request))) return redirect(`${adminPath}/login`);
+      return htmlResponse(renderUsersPage(adminPath));
+    }
+    if(url.pathname === `${adminPath}/globals`){
+      if(!(await verifySession(env, request))) return redirect(`${adminPath}/login`);
+      return htmlResponse(renderGlobalsPage(adminPath));
+    }
+    if(url.pathname === `${adminPath}/invites`){
+      if(!(await verifySession(env, request))) return redirect(`${adminPath}/login`);
+      return htmlResponse(renderInvitesPage(adminPath, cfg.globals||[]));
+    }
+    if(url.pathname === `${adminPath}/settings`){
+      if(!(await verifySession(env, request))) return redirect(`${adminPath}/login`);
+      return htmlResponse(renderSettingsPage(adminPath, cfg));
+    }
+
+    /* ---------- Admin APIs (auth required) ---------- */
+    if(url.pathname.startsWith(`${adminPath}/api/`)){
+      if(!(await verifySession(env, request))) return jsonResponse({error:'unauthorized'},401);
+
+      // fetch SKU list by credentials (without saving global) - admin only
+      if(url.pathname === `${adminPath}/api/fetch_skus` && request.method==='POST'){
+        const body = await request.json().catch(()=>({}));
+        const tenantId = (body.tenantId||'').trim();
+        const clientId = (body.clientId||'').trim();
+        const clientSecret = (body.clientSecret||'').trim();
+        if(!tenantId || !clientId || !clientSecret) return jsonResponse({success:false,message:'缺少租户/客户端信息'},400);
+        try{
+          const tmp = { tenantId, clientId, clientSecret };
+          const token = await getAccessTokenForGlobal(tmp, fetch);
+          const resp = await fetch('https://graph.microsoft.com/v1.0/subscribedSkus',{headers:{Authorization:`Bearer ${token}`}});
+          if(!resp.ok){
+            const err = await resp.json().catch(()=>({}));
+            return jsonResponse({success:false,message:err?.error?.message||'获取失败'},400);
+          }
+          const data = await resp.json();
+          const map = {};
+          (data.value||[]).forEach(s=>{ map[s.skuPartNumber] = s.skuId; });
+          return jsonResponse({success:true,map});
+        }catch(e){
+          return jsonResponse({success:false,message:e.message||'获取失败'},400);
+        }
+      }
+
+      // globals CRUD
+      if(url.pathname === `${adminPath}/api/globals` && request.method==='GET'){
+        const list = (cfg.globals||[]).map(g=>({...g, clientSecret: undefined}));
+        return jsonResponse(list);
+      }
+      if(url.pathname === `${adminPath}/api/globals` && request.method==='POST'){
+        const body = await request.json().catch(()=>({}));
+        const id = crypto.randomUUID();
+        const item = {
+          id,
+          label: body.label || '未命名',
+          defaultDomain: body.defaultDomain || '',
+          tenantId: body.tenantId || '',
+          clientId: body.clientId || '',
+          clientSecret: body.clientSecret || '',
+          skuMap: sanitizeSkuMap(body.skuMap)
+        };
+        cfg.globals = cfg.globals || [];
+        cfg.globals.push(item);
+        await setConfig(env, cfg);
+        return jsonResponse({success:true,id});
+      }
+      if(url.pathname.match(`${adminPath}/api/globals/[^/]+$`) && request.method==='GET'){
+        const gid = url.pathname.split('/').pop();
+        const g = (cfg.globals||[]).find(x=>x.id===gid);
+        if(!g) return jsonResponse({error:'not found'},404);
+        return jsonResponse(g);
+      }
+      if(url.pathname.match(`${adminPath}/api/globals/[^/]+$`) && request.method==='PATCH'){
+        const gid = url.pathname.split('/').pop();
+        const body = await request.json().catch(()=>({}));
+        const idx = (cfg.globals||[]).findIndex(x=>x.id===gid);
+        if(idx===-1) return jsonResponse({error:'not found'},404);
+        cfg.globals[idx] = {
+          ...cfg.globals[idx],
+          label: body.label || cfg.globals[idx].label,
+          defaultDomain: body.defaultDomain || cfg.globals[idx].defaultDomain,
+          tenantId: body.tenantId || cfg.globals[idx].tenantId,
+          clientId: body.clientId || cfg.globals[idx].clientId,
+          clientSecret: body.clientSecret || cfg.globals[idx].clientSecret,
+          skuMap: body.skuMap ? sanitizeSkuMap(body.skuMap) : cfg.globals[idx].skuMap
+        };
+        await setConfig(env, cfg);
+        return jsonResponse({success:true});
+      }
+      if(url.pathname.match(`${adminPath}/api/globals/[^/]+$`) && request.method==='DELETE'){
+        const gid = url.pathname.split('/').pop();
+        cfg.globals = (cfg.globals||[]).filter(x=>x.id!==gid);
+        await setConfig(env, cfg);
+        return jsonResponse({success:true});
+      }
+      if(url.pathname.match(`${adminPath}/api/globals/[^/]+/skus$`) && request.method==='GET'){
+        const gid = url.pathname.split('/').slice(-2,-1)[0];
+        const g = (cfg.globals||[]).find(x=>x.id===gid);
+        if(!g) return jsonResponse({success:false,message:'未找到全局'},404);
+        try{
+          const token = await getAccessTokenForGlobal(g, fetch);
+          const resp = await fetch('https://graph.microsoft.com/v1.0/subscribedSkus',{headers:{Authorization:`Bearer ${token}`}});
+          const data = await resp.json();
+          const map = {};
+          (data.value||[]).forEach(s=>{ map[s.skuPartNumber] = s.skuId; });
+          return jsonResponse({success:true,map});
+        }catch(e){
+          return jsonResponse({success:false,message:e.message},400);
+        }
+      }
+
+      // settings
+      if(url.pathname === `${adminPath}/api/config` && request.method==='POST'){
+        const body = await request.json().catch(()=>({}));
+
+        // admin path
+        const newPath = (body.adminPath || adminPath).toString().trim() || adminPath;
+
+        // admin credentials
+        if(body.adminUsername !== undefined){
+          const u = (body.adminUsername || '').toString().trim();
+          if(!/^[a-zA-Z0-9_\-]{3,32}$/.test(u)){
+            return jsonResponse({success:false,message:'用户名格式不正确（3-32位，仅字母/数字/_/-）'},400);
+          }
+          cfg.adminUsername = u;
+        }
+        if(body.adminPassword){
+          const p = body.adminPassword.toString();
+          if(p.length < 8){
+            return jsonResponse({success:false,message:'密码至少 8 位'},400);
+          }
+          cfg.adminPasswordHash = await sha256(p);
+        }
+
+        // others
+        cfg.turnstile = body.turnstile || cfg.turnstile;
+        cfg.protectedUsers = Array.isArray(body.protectedUsers) ? body.protectedUsers : (cfg.protectedUsers||[]);
+        cfg.protectedPrefixes = Array.isArray(body.protectedPrefixes) ? body.protectedPrefixes : (cfg.protectedPrefixes||[]);
+        cfg.invite = { ...(cfg.invite||{}), enabled: !!body.inviteEnabled };
+        cfg.adminPath = newPath;
+
+        cfg = mergeConfig(cfg);
+        await setConfig(env, cfg);
+        return jsonResponse({success:true,newPath});
+      }
+
+      // users list
+      if(url.pathname === `${adminPath}/api/users` && request.method==='GET'){
+        let result = [];
+        for(const g of (cfg.globals||[])){
+          try{
+            const token = await getAccessTokenForGlobal(g, fetch);
+            const resp = await fetch('https://graph.microsoft.com/v1.0/users?$select=id,displayName,userPrincipalName,createdDateTime,assignedLicenses&$top=100&$orderby=createdDateTime desc&$count=true',{headers:{Authorization:`Bearer ${token}`,'ConsistencyLevel':'eventual'}});
+            const data = await resp.json();
+            let arr = data.value || [];
+            arr = filterProtectedUsers(arr, env, cfg);
+
+            const idToName = Object.entries(g.skuMap || {}).reduce((m,[k,v]) => { m[v]=k; return m; }, {});
+            arr.forEach(u=>{
+              u.assignedLicenses = (u.assignedLicenses||[]).map(l=>{
+                const name = idToName[l.skuId] || l.skuId || '';
+                return {...l,name};
+              });
+              u._licSort = (u.assignedLicenses||[]).map(l=>l.name||'').join(','); // for sorting/search
+              u._globalId = g.id; u._globalLabel = g.label;
+            });
+            result = result.concat(arr);
+          }catch(e){}
+        }
+        return jsonResponse(result);
+      }
+
+      // delete user
+      if(url.pathname.match(`${adminPath}/api/users/[^/]+/[^/]+$`) && request.method==='DELETE'){
+        const parts = url.pathname.split('/');
+        const userId = parts.pop();
+        const gId = parts.pop();
+        const g = (cfg.globals||[]).find(x=>x.id===gId);
+        if(!g) return jsonResponse({error:'not found'},404);
+        const token = await getAccessTokenForGlobal(g, fetch);
+
+        // pre-check protected (fail-closed to avoid mis-delete)
+        const checkResp = await fetch(`https://graph.microsoft.com/v1.0/users/${userId}?$select=userPrincipalName`,{
+          headers:{Authorization:`Bearer ${token}`}
+        });
+        if(!checkResp.ok){
+          return jsonResponse({error:'cannot_verify_user'},502);
+        }
+        const user = await checkResp.json();
+        const upn = user.userPrincipalName || '';
+        if(isProtectedUpn(upn, env, cfg)) return jsonResponse({error:'forbidden'},403);
+
+        const delResp = await fetch(`https://graph.microsoft.com/v1.0/users/${userId}`,{
+          method:'DELETE',
+          headers:{Authorization:`Bearer ${token}`}
+        });
+        if(!delResp.ok){
+          const t = await delResp.text().catch(()=> '');
+          return jsonResponse({error:'delete_failed', details: t.slice(0,300)}, delResp.status);
+        }
+        return jsonResponse({success:true});
+      }
+
+      // reset password
+      if(url.pathname.match(`${adminPath}/api/users/[^/]+/[^/]+/password$`) && request.method==='PATCH'){
+        const parts = url.pathname.split('/');
+        const userId = parts[parts.length-2];
+        const gId = parts[parts.length-3];
+        const body = await request.json().catch(()=>({}));
+        const g = (cfg.globals||[]).find(x=>x.id===gId);
+        if(!g) return jsonResponse({error:'not found'},404);
+        const token = await getAccessTokenForGlobal(g, fetch);
+        await fetch(`https://graph.microsoft.com/v1.0/users/${userId}`,{
+          method:'PATCH',
+          headers:{Authorization:`Bearer ${token}`,'Content-Type':'application/json'},
+          body:JSON.stringify({passwordProfile:{forceChangePasswordNextSignIn:false,password:body.password}})
+        });
+        return jsonResponse({success:true});
+      }
+
+      // licenses
+      if(url.pathname === `${adminPath}/api/licenses` && request.method==='GET'){
+        let list = [];
+        for(const g of (cfg.globals||[])){
+          try{
+            const token = await getAccessTokenForGlobal(g, fetch);
+
+            // subscription expiry/renew time (nextLifecycleDateTime)
+            let expiryBySkuId = {};
+            try{
+              const subResp = await fetch('https://graph.microsoft.com/v1.0/directory/subscriptions?$select=skuId,skuPartNumber,nextLifecycleDateTime,status',{
+                headers:{Authorization:`Bearer ${token}`}
+              });
+              if(subResp.ok){
+                const subData = await subResp.json().catch(()=>({}));
+                (subData.value||[]).forEach(cs=>{
+                  const skuId = (cs.skuId||'').toString().toLowerCase();
+                  const dt = cs.nextLifecycleDateTime;
+                  if(!skuId || !dt) return;
+                  if(!expiryBySkuId[skuId] || new Date(dt) < new Date(expiryBySkuId[skuId])) expiryBySkuId[skuId] = dt;
+                });
+              }
+            }catch(e){}
+
+            const resp = await fetch('https://graph.microsoft.com/v1.0/subscribedSkus',{headers:{Authorization:`Bearer ${token}`}});
+            const data = await resp.json();
+            (data.value||[]).forEach(s=>{
+              const skuIdLower = (s.skuId||'').toString().toLowerCase();
+              list.push({
+                globalId:g.id,
+                globalLabel:g.label,
+                skuPartNumber:s.skuPartNumber,
+                skuId:s.skuId,
+                total:s.prepaidUnits?.enabled||0,
+                used:s.consumedUnits||0,
+                expiresAt: expiryBySkuId[skuIdLower] || null
+              });
+            });
+          }catch(e){}
+        }
+        return jsonResponse(list);
+      }
+
+      // invites
+      if(url.pathname === `${adminPath}/api/invites` && request.method==='GET'){
+        await ensureInvites(env);
+        let list = await getInvites(env);
+        return jsonResponse(list);
+      }
+      if(url.pathname === `${adminPath}/api/invites/generate` && request.method==='POST'){
+        const body = await request.json().catch(()=>({}));
+        const sets = body.sets||[];
+        const length = body.length||16;
+        const qty = body.quantity||1;
+        const limit = body.limit||1;
+        const scopes = body.scopes||[];
+        const dict = {
+          upper: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ',
+          lower: 'abcdefghijklmnopqrstuvwxyz',
+          digit: '0123456789',
+          sym: '!@#$%^&*()-_=+[]{}<>?'
+        };
+        let pool = '';
+        sets.forEach(s=>{ if(dict[s]) pool+=dict[s]; });
+        if(!pool) return jsonResponse({success:false,message:'请选择字符集'},400);
+        if(!scopes.length) return jsonResponse({success:false,message:'请选择限制范围'},400);
+        await ensureInvites(env);
+        const invites = await getInvites(env);
+        for(let i=0;i<qty;i++){
+          let code=''; for(let j=0;j<length;j++) code+=pool[Math.floor(Math.random()*pool.length)];
+          invites.push({code,limit,used:0,createdAt:Date.now(),usedAt:null,allowed:scopes});
+        }
+        await saveInvites(env,invites);
+        return jsonResponse({success:true,count:qty});
+      }
+      if(url.pathname === `${adminPath}/api/invites/bulk` && request.method==='DELETE'){
+        const body = await request.json().catch(()=>({codes:[]}));
+        const codes = body.codes||[];
+        const invites = await getInvites(env);
+        const filtered = invites.filter(c=>!codes.includes(c.code));
+        await saveInvites(env, filtered);
+        return jsonResponse({success:true,removed: codes.length});
+      }
+    }
+
+    /* ---------- Public register page ---------- */
+    if(request.method === 'GET' && url.pathname === '/'){
+      const globals = (cfg.globals || []).map(g => ({ id: g.id, label: g.label }));
+      const selectedGlobalId = url.searchParams.get('g') || globals[0]?.id || '';
+      const selectedGlobal = (cfg.globals || []).find(g => g.id === selectedGlobalId) || (cfg.globals || [])[0];
+
+      // Build SKU list with remaining counts (server-rendered to avoid exposing admin-query APIs)
+      let skuDisplayList = [];
+      if (selectedGlobal) {
+        try {
+          const subscribed = await fetchSubscribedSkus(selectedGlobal, fetch);
+          const bySkuId = new Map(subscribed.map(s => [String(s.skuId).toLowerCase(), s]));
+          const skuMap = selectedGlobal.skuMap || {};
+          skuDisplayList = Object.keys(skuMap).map(name => {
+            const skuId = String(skuMap[name] || '').toLowerCase();
+            const sku = bySkuId.get(skuId);
+            const rem = sku ? remainingFromSubscribedSku(sku) : 0;
+            return { name, remaining: rem, label: `${name}（剩余总量：${rem}）` };
+          });
+          skuDisplayList.sort((a,b)=> (b.remaining - a.remaining) || a.name.localeCompare(b.name));
+        } catch {
+          // fail closed: still render name list without remaining
+          const skuMap = selectedGlobal.skuMap || {};
+          skuDisplayList = Object.keys(skuMap).map(name => ({ name, remaining: 0, label: `${name}（剩余总量：0）` }));
+        }
+      }
+
+      return htmlResponse(renderRegisterPage({
+        globals,
+        selectedGlobalId,
+        skuDisplayList,
+        protectedPrefixes: cfg.protectedPrefixes || [],
+        turnstileSiteKey: cfg.turnstile?.siteKey || '',
+        inviteMode: !!cfg.invite?.enabled,
+        adminPath,
+      }));
+    }
+
+    if(request.method === 'POST' && url.pathname === '/'){
+      cfg = await getConfig(env); // refresh
+      return handleRegister(env, request, cfg);
+    }
+
+    return new Response('Not Found', { status: 404 });
+  }
+};
