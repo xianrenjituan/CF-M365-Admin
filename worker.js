@@ -21,7 +21,7 @@ const DEFAULT_CONFIG = {
   invite: { enabled: false },
 };
 
-const GITHUB_LINK = 'https://github.com/zixiwangluo/CF-M365-Admin';
+const GITHUB_LINK = 'https://github.com/xianrenjituan/CF-M365-Admin';
 
 /* -------------------- Utility -------------------- */
 const enc = new TextEncoder();
@@ -645,7 +645,7 @@ label.inline{display:flex;align-items:center;gap:8px;margin:6px 0;}
   <div class="nav-left">
     <span style="font-weight:800;font-size:16px;">⚡ Office 365 Admin</span>
     <span class="badge">安全模式</span>
-    <a href="https://github.com/zixiwangluo/CF-M365-Admin" target="_blank" style="display:flex;align-items:center;gap:6px;">${GITHUB_ICON}<span>GitHub CF-M365-Admin</span></a>
+    <a href="https://github.com/xianrenjituan/CF-M365-Admin" target="_blank" style="display:flex;align-items:center;gap:6px;">${GITHUB_ICON}<span>GitHub CF-M365-Admin</span></a>
   </div>
   <div class="tabs">
     <a class="tab ${active==='users'?'active':''}" href="${adminPath}/users">用户</a>
@@ -692,7 +692,7 @@ h2{margin:0 0 12px 0;}
     <button type="submit" id="btn">保存并进入后台</button>
   </form>
   <div id="msg" class="message" style="display:none;"></div>
-  <div class="footer" style="margin-top:14px;display:flex;gap:8px;flex-wrap:wrap;align-items:center;">${GITHUB_ICON}<a href="https://github.com/zixiwangluo/CF-M365-Admin" target="_blank">CF-M365-Admin</a></div>
+  <div class="footer" style="margin-top:14px;display:flex;gap:8px;flex-wrap:wrap;align-items:center;">${GITHUB_ICON}<a href="https://github.com/xianrenjituan/CF-M365-Admin" target="_blank">CF-M365-Admin</a></div>
 </div>
 <script>
 document.getElementById('setupForm').addEventListener('submit', async (e)=>{
@@ -743,7 +743,7 @@ body{display:flex;align-items:center;justify-content:center;min-height:100vh;pad
 <div class="card">
   <div class="header-row" style="margin-bottom:10px;">
     <h2>后台登录</h2>
-    <a href="https://github.com/zixiwangluo/CF-M365-Admin" class="icon-link" target="_blank">${GITHUB_ICON}</a>
+    <a href="https://github.com/xianrenjituan/CF-M365-Admin" class="icon-link" target="_blank">${GITHUB_ICON}</a>
   </div>
   <form id="loginForm">
     <div class="row">
