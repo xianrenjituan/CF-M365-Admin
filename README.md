@@ -188,3 +188,5 @@ Worker Settings → Bindings
 ## License
 
 MIT License
+
+原仓库链接https://github.com/zixiwangluo/CF-M365-Admin/tree/main
